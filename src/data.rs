@@ -39,10 +39,5 @@ impl AppContext {
             svelte_path: root.join("svelte"),
         }
     }
-
-    /// Utility: resolve a path under the root.
-    pub fn under(&self, rel: impl AsRef<Path>) -> PathBuf {
-        self.root_path.join(rel)
-    }
 }
 
