@@ -1,14 +1,16 @@
-/// Handles verification and installation of packages.
-/// In this context, "packages" are tools like "git", "node", "npm", etc.
-/// These are external dependencies that the app relies on to function correctly.
+//! Verifies and optionally installs external tools (git, node, npm, etc.).
+//!
+//! Installation is intentionally conservative and currently unimplemented;
+//! environments differ and interactive package managers can be fragile.
+//! We surface clear messaging and keep the logic centralized for later work.
 
 use crate::consts::REQUIRED_PACKAGES;
 use crate::data::AppContext;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// Best-effort presence check by invoking `--version`.
 pub fn is_installed(package: &str) -> bool {
-    // Simple check: try to run `package --version` and see if it succeeds.
     match crate::commands::run(&format!("{} --version", package)) {
         Ok(_) => true,
         Err(_) => false,
@@ -54,7 +56,7 @@ pub fn verify_and_install_packages(app_context: &AppContext) {
     // introduce a bounded job queue with a small worker pool (2–3 workers max).
     if app_context.auto_install {
         for pkg in missing {
-            // Keep your "todo" spirit but provide a sane place to plug it in.
+            // Keep a single point to plug future installers (winget/brew/apt/etc.).
             // Replace this call with your real installer (winget/brew/apt/etc.).
             match install_package(pkg, app_context) {
                 Ok(()) => println!("[ + ] Installed package: {}", pkg),

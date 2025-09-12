@@ -1,8 +1,18 @@
-use std::io;
-use std::process::{ Command, Stdio };
+//! Shell command helpers and a small `cmd!` macro.
+//!
+//! These utilities centralize how external commands are executed so that
+//! logging, error handling, and platform differences are consistently handled.
 
-/// Runs a shell command, returning its output or an error if something went wrong.
-/// * @returns: Stdout as String on success, io::Error on failure.
+use std::io;
+use std::process::{Command, Stdio};
+
+/// Runs a shell command and returns its stdout as a `String`.
+///
+/// - Uses `cmd /C` on Windows and `sh -c` elsewhere.
+/// - Captures both stdout and stderr in a single run (no double-spawn).
+/// - On nonzero exit, returns an error that includes the process status and stderr.
+///
+/// Returns: `Ok(stdout)` on success; `Err(io::Error)` on failure.
 pub fn run(line: &str) -> io::Result<String> {
     #[cfg(windows)]
     let mut cmd = {
@@ -44,7 +54,10 @@ pub fn run(line: &str) -> io::Result<String> {
 
 #[macro_export]
 /// * Utility macro to run shell commands, exiting on failure.
-///  Usage: `cmd!( "command arg1 arg2", "another command" )`
+/// - Usage (single): `cmd!("echo hello") -> String`
+/// - Usage (multiple): `cmd!("echo a", "echo b") -> Vec<String>`
+///
+/// In debug builds, prints each command and its captured output to stdout.
 macro_rules! cmd {
     // Single command
     ($raw:expr) => {
@@ -62,30 +75,24 @@ macro_rules! cmd {
         }
     };
 
-    // Multiple commands
-    (*($raw:expr),) => {
-        {
-            let output = Vec::new(); // To store command outputs if needed
-
-            $(
-                match crate::commands::run($raw) {
-                    Ok(output) => {
-                        // If on debug show the output
-                        #[cfg(debug_assertions)]
-                        println!("Command '{}' output: {}", $raw, output);
-
-                        output.push(output);
-                    }
-                    Err(e) => {
-                        eprintln!("Error running command '{}': {}", $raw, e);
-                        std::process::exit(1);
-                    }
+    // Multiple commands -> Vec<String>
+    ($($raw:expr),+ $(,)?) => {{
+        let mut outputs = ::std::vec::Vec::new();
+        $(
+            match crate::commands::run($raw) {
+                Ok(out) => {
+                    #[cfg(debug_assertions)]
+                    println!("Command '{}' output: {}", $raw, out);
+                    outputs.push(out);
                 }
-            )*
-
-            output // Return all outputs as a Vec<String>
-        }
-    };
+                Err(e) => {
+                    eprintln!("Error running command '{}': {}", $raw, e);
+                    std::process::exit(1);
+                }
+            }
+        )+
+        outputs
+    }};
 }
 
             

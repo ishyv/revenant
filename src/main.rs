@@ -1,3 +1,7 @@
+//! Revenant CLI: orchestrates Svelte project setup and provides a place to grow
+//! additional workflows. The actual Svelte syntax transforms live in a separate
+//! `revenantc` binary (see `src/bin/revenantc.rs`) to keep responsibilities clear.
+
 mod data;
 mod commands;
 mod consts;
@@ -6,19 +10,11 @@ mod fs_util;
 mod macros;
 mod rusty_utils;
 
-use std::{ collections::HashMap, io, path::PathBuf };
-use crate::{ data::AppContext, package_manager::verify_and_install_packages, rusty_utils::IoResultDialog };
+use std::{io, path::PathBuf};
+use crate::{data::AppContext, package_manager::verify_and_install_packages, rusty_utils::IoResultDialog};
 use clap::{ Parser, Subcommand };
 
-/// Creates the necessary folders/files for the App to run.
-fn setup(app_context: &AppContext) -> std::io::Result<()> {
-    verify_and_install_packages(app_context);
-
-    // Everything went fine
-    Ok(())
-}
-
-/// Simple program to greet a person
+/// Entrypoint for the `revenant` CLI.
 #[derive(Parser)]
 #[command(version = "1", about = "Revenant CLI", long_about = None)]
 struct Args {
@@ -28,7 +24,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Full setup
+    /// Full setup: generate/prepare the Svelte project and sanity-build it.
     Full {
         /// * If true, will skip errors and continue with the next step.
         /// ! Use with caution; may leave the setup in a partial state.

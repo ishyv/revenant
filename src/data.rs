@@ -1,9 +1,9 @@
+//! Application context (paths, configuration flags), shared across steps.
+//!
+//! Keep this lean and focused on values that many parts of the program need.
+//! Prefer deriving small helpers instead of storing redundant fields.
 
-/// Handles app "state".
-/// In other words, this module defines the structure that holds the app's data.
-/// Made to not only store data, but also provide utilities to work with it.
-
-use std::{path::{Path, PathBuf}};
+use std::path::PathBuf;
 
 /// Represents the global app data.
 /// Allows different parts of the project to know "where" and "how" to do things necessary
@@ -11,9 +11,6 @@ use std::{path::{Path, PathBuf}};
 /// - Ex. Where to store output files, where to find config files, etc.
 #[derive(Clone)]
 pub struct AppContext {
-    /// Marely for aesthetics, not used for anything important.
-    pub project_name: String,
-
     /// If true, will attempt to auto-install missing packages.
     /// Otherwise will just error out if a required package is missing.
     pub auto_install: bool,
@@ -28,13 +25,15 @@ pub struct AppContext {
 
 
 impl AppContext {
-    pub fn new(root: impl Into<PathBuf> ) -> Self {
-
-        let root = root.into(); // Ensure we have a PathBuf, used to be able to create relative paths.
-
+    /// Constructs a new `AppContext` rooted at `root`.
+    ///
+    /// - `root_path` becomes the output directory (see `consts::DEFAULT_ROOT`).
+    /// - `svelte_path` is derived as `<root>/svelte`.
+    /// - `auto_install` defaults to `false` (explicit install preferred for safety).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         Self {
-            project_name: "Revenant".to_string(),
-            auto_install: false, // TODO: once auto-install is implemented, make this configurable.
+            auto_install: false,
             root_path: root.clone(),
             svelte_path: root.join("svelte"),
         }

@@ -1,15 +1,19 @@
-/// Build parallel vectors of (names, functions) from `name: callable` pairs.
-/// Supports closures that capture environment by accepting `$func:expr`.
-/// The typed arm boxes each callable into the requested type (e.g., `Step<'a>`).
+/// Build parallel vectors of `(names, functions)` from `name: callable` pairs.
 ///
-/// Usage:
-/// ```rust
-/// let (names, funcs): (Vec<String>, Vec<Step<'program>>) = named_function_vec![
-///     @type Step<'program>;
-///     create_root: |ctx: &AppContext| -> std::io::Result<()> { /* ... */ },
-///     verify_packages: |ctx: &AppContext| -> std::io::Result<()> { /* ... */ },
-/// ];
-/// ```
+/// - Use the typed form when you want explicit control over the value type:
+///   ```rust
+///   let (names, funcs): (Vec<String>, Vec<Step<'program>>) = named_function_vec![
+///       @type Step<'program>;
+///       create_root: |ctx: &AppContext| -> std::io::Result<()> { /* ... */ },
+///       verify_packages: |ctx: &AppContext| -> std::io::Result<()> { /* ... */ },
+///   ];
+///   ```
+/// - The default form assumes you’re calling it inside a function that defines
+///   a `'program` lifetime (e.g., `fn build<'program>(...)`), so that the
+///   boxed callable type can include `'program`.
+///
+/// This pattern makes it easy to keep step names synchronized with their
+/// implementations for reporting and error handling.
 #[macro_export]
 macro_rules! named_function_vec {
     // Typed form: values are coerced into the provided type (typically a boxed trait object).
@@ -30,8 +34,7 @@ macro_rules! named_function_vec {
         }
     };
 
-    // Default form: assume a common boxed callable type used in your project.
-    // Adjust the default to your actual alias if you want implicit usage.
+    // Default form: assumes `AppContext` and `'program` are in scope at call-site.
     ($($name:ident: $func:expr),+ $(,)?) => {
         {
         $crate::named_function_vec![
