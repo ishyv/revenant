@@ -1,9 +1,36 @@
-<div
-    class="grid place-content-center min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-50"
->
-    <h1
-        class="bg-clip-text text-transparent bg-gradient-to-r from-cyan-600 light:via-gray-900 dark:via-blue-900 to-gray-200"
+<script lang="ts">
+  import { onMount } from "svelte";
+
+  let count = $state(0);
+
+    function onclick() {
+        count++;
+        }
+
+    function attach(node: HTMLElement) {
+        count;
+      node.appendChild(document.createTextNode("!"));
+    }
+
+</script>
+
+<div class="grid place-content-center min-h-screen">
+  <p class="text-center" {@attach attach}>{count}</p>
+  <div class="flex items-center space-x-2">
+    <button class="px-4 py-2 bg-blue-500 rounded" onclick={() => count--}
+      >-</button
     >
-        Revenant
-    </h1>
+    <button class="px-4 py-2 bg-blue-500 rounded" {onclick}>+</button>
+    <button class="px-4 py-2 bg-red-500 rounded" onclick={() => (count = 0)}
+      >Reset</button
+    >
+  </div>
+
+  {#if count > 10}
+    <p class="text-center text-green-500">You reached 10!</p>
+  {/if}
+
+  {#if count < 0}
+    <p class="text-center text-red-500">Negative count!</p>
+  {/if}
 </div>

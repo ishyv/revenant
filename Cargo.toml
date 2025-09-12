@@ -2,15 +2,6 @@
 name = "revenant"
 version = "0.1.0"
 edition = "2024"
-default-run = "main"
-
-[[bin]]
-name = "main"
-path = "src/main.rs"
-
-[[bin]]
-name = "cli"
-path = "src/cli.rs"
 
 [dependencies]
 clap = { version = "4.5.47", features = ["derive"] }

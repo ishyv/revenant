@@ -81,9 +81,9 @@ fn build_setup_pipeline<'program>(
 
         // "setup-svelte" — generate project, add defaults, copy files, initial build.
         setup_svelte: |_: &AppContext| -> io::Result<()> {
-            // Generate a fresh Svelte skeleton
+            // Generate a fresh Svelte skeleton using Vite’s stable template (no extra global tools required)
             cmd!(&format!(
-                "npx sv create {} --template minimal --types ts --install npm --no-add-ons",
+                "npm create vite@latest {} -- --template svelte-ts",
                 app_context.svelte_path.to_string_lossy()
             ));
 
@@ -151,3 +151,6 @@ pub fn main() {
         }
     }
 }
+
+
+
