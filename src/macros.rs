@@ -46,3 +46,77 @@ macro_rules! named_function_vec {
         }
     };
 }
+
+#[macro_export]
+/// Defines a strongly-typed, file-backed text template with a `render` method.
+///
+/// - Generates a zero-sized struct `Name` with:
+///   - `const CONTENT: &str` = include_str!(path)
+///   - `fn render(<fields>) -> String` that replaces `{{field}}` placeholders
+///     with provided values (exact string match).
+/// - The function signature enforces that all declared fields are provided at
+///   call sites (compile-time), avoiding ad-hoc maps.
+/// - With no fields, `render()` returns the template unchanged.
+///
+/// Example:
+///   define_template! {
+///       pub Template RevenantGlobal {
+///           path: "src/templates/revenant.global.template.ts",
+///           version: &str,
+///           root: &str,
+///           svelte: &str,
+///           compiler: &str,
+///       }
+///   }
+macro_rules! define_template {
+    // With fields: generate render(args...)
+    (
+        $(#[$meta:meta])*
+        $vis:vis Template $Name:ident {
+            path: $path:expr,
+            $( $field:ident : $fty:ty ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $Name;
+
+        impl $Name {
+            pub const CONTENT: &'static str = ::core::include_str!($path);
+
+            #[allow(clippy::needless_pass_by_value)]
+            pub fn render( $( $field : $fty ),+ ) -> ::std::string::String {
+                let mut s = ::std::string::String::from(Self::CONTENT);
+                $(
+                    let ph = ::std::string::String::from("{{") + ::std::stringify!($field) + "}}";
+                    s = s.replace(&ph, $field);
+                )+
+                #[cfg(debug_assertions)]
+                {
+                    if let Some(idx) = s.find("{{") {
+                        eprintln!("[revenant] warning: unreplaced placeholder near byte {} in {}", idx, ::std::stringify!($Name));
+                    }
+                }
+                s
+            }
+        }
+    };
+
+    // No fields: render() returns content unchanged (no mut warning)
+    (
+        $(#[$meta:meta])*
+        $vis:vis Template $Name:ident {
+            path: $path:expr $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $Name;
+
+        impl $Name {
+            pub const CONTENT: &'static str = ::core::include_str!($path);
+
+            pub fn render() -> ::std::string::String {
+                ::std::string::String::from(Self::CONTENT)
+            }
+        }
+    };
+}

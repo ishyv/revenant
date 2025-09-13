@@ -1,3 +1,6 @@
+> [!WARNING]
+> This is an early prototype. The design and implementation are subject to change.
+
 # Revenant
 
 Revenant is a Rust CLI that bootstraps a SvelteKit app and (optionally) applies
@@ -13,10 +16,10 @@ Svelte compiler.
 ## What’s in the box
 
 - `revenant` (Rust binary): sets up a Svelte project in `./output/svelte`,
-  installs defaults, copies a small starter, and runs a sanity build.
-- `revenantc` (Rust binary): a small, modular transform pipeline used as a
-  Svelte preprocessor. It reads a JSON payload on stdin and prints JSON to stdout.
-- `output/svelte/revenant-preprocess.js`: a Node wrapper that spawns `revenantc`.
+  installs defaults, copies a small starter, and runs dev/build/preview.
+  
+Note: the experimental Rust compiler/preprocessor has been removed for now until
+the syntax and parser approach are finalized.
 
 ## Why this design
 
@@ -24,6 +27,9 @@ Svelte compiler.
 - Keep Rust transforms small, testable, and independent using a `Pass` trait and
   a linear `Pipeline`.
 - Make the preprocessor opt-in via an environment flag for safety and easy opt-out.
+  
+For a deeper dive into the design and code organization, see `docs/ARCHITECTURE.md`.
+
 
 ## Quick start
 
@@ -31,44 +37,43 @@ Svelte compiler.
 
    - `cargo build`
 
-2. Enable the preprocessor (opt-in):
+2. Let Revenant own the app lifecycle:
 
-   - From `output/svelte/` run:
+   - Initial setup (scaffold app, install deps, build):
 
-     ```bash
-     REVENANT_PREPROCESS=1 \
-     REVENANTC_BIN=../../target/debug/revenantc \
-     npm run dev
-     ```
+      `cargo run -- full`
 
-3. Try demo syntax:
+   - Dev server (env wiring is automatic):
 
-   - In any `.svelte` file:
+      `cargo run -- dev`
 
-     ```svelte
-     <rv:upper text="hello world" />
-     ```
+   - Production build:
 
-   - Should render as `HELLO WORLD` in place (from the demo pass).
+      `cargo run -- build`
+
+   - Preview build:
+
+      `cargo run -- preview`
+
+3. Optional preprocessor (disabled):
+
+   - Preprocessor integration is not available in this revision. When the
+     compiler returns with a proper parser-backed design, documentation will be
+     updated with usage instructions.
 
 ## Architecture
 
-- `src/compiler/`:
-  - `mod.rs`: JSON protocol + `Pass` trait + `Pipeline` runner.
-  - `passes/`: small, focused transforms. Start with `noop` and `demo_uppercase`.
-- `src/bin/revenantc.rs`: the compiler CLI — reads JSON, executes pipeline, writes JSON.
-- `output/svelte/revenant-preprocess.js`: Node wrapper exposing `{ markup, script, style }` hooks.
 - `src/main.rs`: `revenant` CLI that scaffolds and builds the app.
+  - Commands: `full`, `dev`, `build`, `preview`, and `step <name>`.
+  
+Historical note: compiler-related modules and the `revenantc` binary have been
+removed pending a redesigned, parser-backed transform pipeline.
 
 ## Adding real transforms
 
-1. Create `src/compiler/passes/my_pass.rs` implementing `Pass`.
-2. Re-export it in `src/compiler/passes/mod.rs`.
-3. Add it to the pipeline in `src/bin/revenantc.rs`.
-
-Prefer small, composable passes. If a transform is markup-only, early-return for
-other kinds. Start with string transforms; when you need structure/sourcemaps,
-integrate a parser (e.g., tree-sitter) and a mapper.
+Not applicable in this revision. The compiler was removed to avoid confusing or
+brittle behavior. If/when transforms return, they will be parser-backed and
+documented with clear syntax and guarantees.
 
 ## Rust ↔ Svelte data sharing
 
@@ -82,4 +87,5 @@ integrate a parser (e.g., tree-sitter) and a mapper.
 
 - Auto-install of tools is intentionally not implemented; environments and
   package managers vary. We detect missing tools and provide clear guidance.
-- The demo pass is intentionally trivial and used to validate the pipeline end-to-end.
+  
+  
