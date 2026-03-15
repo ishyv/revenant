@@ -1,0 +1,258 @@
+// DESIGN: Templates are plain const &str with {project_name} placeholders replaced via
+// String::replace(). A template engine would add a dependency for zero benefit — our
+// templates have exactly one variable.
+
+pub const REVENANT_TOML: &str = r#"[project]
+name = "{project_name}"
+
+[toolchain]
+wasm_target = "bundler"
+pkg_manager = "npm"
+"#;
+
+pub const RUST_CARGO_TOML: &str = r#"[package]
+name = "{project_name}_wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = "0.3"
+"#;
+
+pub const RUST_LIB_RS: &str = r#"use wasm_bindgen::prelude::*;
+
+// ─── Exported Functions ───────────────────────────────────────────────
+// Every `pub fn` with #[wasm_bindgen] becomes callable from JavaScript.
+//
+// Supported types across the WASM boundary:
+//   Parameters:  i32, u32, f64, bool, String, &str, Vec<u8>, JsValue
+//   Returns:     i32, u32, f64, bool, String, Vec<u8>, JsValue
+//
+// DO NOT: return &str (references can't cross WASM), use generics,
+// or pass structs without #[wasm_bindgen] — these won't compile.
+
+#[wasm_bindgen]
+pub fn greet(name: &str) -> String {
+    format!("Hello from {project_name}, {}!", name)
+}
+
+// ─── Try It ───────────────────────────────────────────────────────────
+// Add a function below, save, and `revenant dev` will auto-rebuild.
+// Then call it from Svelte: `wasm.add(2, 3)`
+//
+// #[wasm_bindgen]
+// pub fn add(a: i32, b: i32) -> i32 {
+//     a + b
+// }
+"#;
+
+pub const WEB_PACKAGE_JSON: &str = r#"{
+  "name": "{project_name}-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3",
+    "@sveltejs/kit": "^2",
+    "@sveltejs/vite-plugin-svelte": "^5",
+    "svelte": "^5",
+    "vite": "^6",
+    "vite-plugin-wasm": "^3",
+    "vite-plugin-top-level-await": "^1"
+  }
+}
+"#;
+
+pub const WEB_SVELTE_CONFIG: &str = r#"import adapter from '@sveltejs/adapter-static';
+
+/** @type {import('@sveltejs/kit').Config} */
+const config = {
+	kit: {
+		adapter: adapter({
+			fallback: 'index.html'
+		})
+	}
+};
+
+export default config;
+"#;
+
+pub const WEB_VITE_CONFIG: &str = r#"import { sveltekit } from '@sveltejs/kit/vite';
+import { defineConfig } from 'vite';
+import wasm from 'vite-plugin-wasm';
+import topLevelAwait from 'vite-plugin-top-level-await';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+export default defineConfig({
+	plugins: [
+		wasm(),
+		topLevelAwait(),
+		sveltekit()
+	],
+	resolve: {
+		alias: {
+			'{project_name}_wasm': path.join(__dirname, '../pkg/{project_name}_wasm.js')
+		}
+	},
+	optimizeDeps: {
+		exclude: ['{project_name}_wasm']
+	}
+});
+"#;
+
+pub const WEB_APP_HTML: &str = r#"<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-prerender="true">
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>
+"#;
+
+pub const WEB_PAGE_SVELTE: &str = r#"<script>
+	import { onMount } from 'svelte';
+
+	let greeting = $state('Loading WASM...');
+
+	onMount(async () => {
+		// The import path '{project_name}_wasm' is aliased in vite.config.js
+		// to point to the compiled WASM package in pkg/.
+		const wasm = await import('{project_name}_wasm');
+		greeting = wasm.greet('World');
+
+		// ─── Calling more Rust functions ──────────────────────────
+		// After adding a #[wasm_bindgen] function in rust/src/lib.rs:
+		//   const result = wasm.your_function_name(args);
+		//
+		// ─── Troubleshooting ──────────────────────────────────────
+		// "Module not found" → run `revenant dev` (WASM must be built first)
+		// "wasm.foo is not a function" → check it's `pub` with #[wasm_bindgen]
+	});
+</script>
+
+<h1>{greeting}</h1>
+"#;
+
+pub const GETTING_STARTED_MD: &str = r#"# Getting Started with {project_name}
+
+## Project Structure
+
+```
+{project_name}/
+├── rust/src/lib.rs       ← Your Rust/WASM code (edit this)
+├── web/src/routes/       ← SvelteKit pages
+├── pkg/                  ← Auto-generated WASM output (don't edit)
+├── revenant.toml         ← Project configuration
+└── GETTING_STARTED.md    ← You are here
+```
+
+## Commands
+
+**`revenant dev`** — Start the dev server with auto-rebuild. Edit
+`rust/src/lib.rs`, save, and the browser refreshes automatically.
+
+**`revenant build`** — Create a production build in `web/build/`.
+
+## Adding a New Rust Function
+
+1. Open `rust/src/lib.rs`
+2. Add a function with `#[wasm_bindgen]`:
+   ```rust
+   #[wasm_bindgen]
+   pub fn multiply(a: f64, b: f64) -> f64 {
+       a * b
+   }
+   ```
+3. Call it from Svelte (`web/src/routes/+page.svelte`):
+   ```js
+   const result = wasm.multiply(3, 4); // 12
+   ```
+
+## Next Step
+
+Run `revenant dev`, then edit `rust/src/lib.rs` — you'll see live WASM
+reloading in the browser.
+"#;
+
+pub const WEB_WASM_TS: &str = r#"// TODO(v2): auto-generate typed re-exports from wasm-bindgen output
+//
+// For now, import directly from '{project_name}_wasm' in your components.
+// This file is a placeholder for future generated type bindings.
+
+export {};
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_NAME: &str = "test-project";
+
+    fn substitute(template: &str) -> String {
+        template.replace("{project_name}", TEST_NAME)
+    }
+
+    #[test]
+    fn templates_substitute_cleanly() {
+        let templates = [
+            REVENANT_TOML,
+            RUST_CARGO_TOML,
+            RUST_LIB_RS,
+            WEB_PACKAGE_JSON,
+            WEB_SVELTE_CONFIG,
+            WEB_VITE_CONFIG,
+            WEB_APP_HTML,
+            WEB_PAGE_SVELTE,
+            WEB_WASM_TS,
+            GETTING_STARTED_MD,
+        ];
+        for template in templates {
+            let result = substitute(template);
+            assert!(
+                !result.contains("{project_name}"),
+                "placeholder survived substitution in: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn revenant_toml_parses() {
+        let content = substitute(REVENANT_TOML);
+        let value: toml::Value = toml::from_str(&content).expect("TOML should parse");
+        assert_eq!(value["project"]["name"].as_str().unwrap(), TEST_NAME);
+    }
+
+    #[test]
+    fn rust_cargo_toml_parses() {
+        let content = substitute(RUST_CARGO_TOML);
+        let value: toml::Value = toml::from_str(&content).expect("Cargo.toml should parse");
+        assert_eq!(
+            value["package"]["name"].as_str().unwrap(),
+            format!("{TEST_NAME}_wasm")
+        );
+    }
+
+    #[test]
+    fn package_json_is_valid() {
+        let content = substitute(WEB_PACKAGE_JSON);
+        assert!(content.trim().starts_with('{'));
+        assert!(content.contains(&format!("\"{TEST_NAME}-web\"")));
+    }
+}
