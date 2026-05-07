@@ -54,10 +54,7 @@ impl Tool {
     pub fn auto_install(self) -> Result<(), String> {
         match self {
             Tool::WasmPack => {
-                println!(
-                    "{} Installing wasm-pack via cargo...",
-                    "▸".yellow().bold()
-                );
+                println!("{} Installing wasm-pack via cargo...", "▸".yellow().bold());
                 let status = Command::new("cargo")
                     .args(["install", "wasm-pack"])
                     .status()
@@ -125,10 +122,7 @@ pub fn require_tools(tools: &[Tool]) -> Result<(), RevenantError> {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  {} auto-install failed: {e}",
-                        "✗".red().bold()
-                    );
+                    eprintln!("  {} auto-install failed: {e}", "✗".red().bold());
                     still_missing.push(MissingTool {
                         name: tool.display_name().to_string(),
                         install_hint: tool.install_hint().to_string(),

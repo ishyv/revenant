@@ -1,8 +1,5 @@
 <script>
-	import { onMount } from 'svelte';
-
-	/** @type {typeof import('prime_sieve_wasm') | null} */
-	let wasm = $state(null);
+	import wasm from '$lib/wasm';
 
 	let limit = $state(100000);
 	let checkTarget = $state(7919);
@@ -12,12 +9,7 @@
 	let elapsed = $state(null);
 	let isPrimeResult = $state(null);
 
-	onMount(async () => {
-		wasm = await import('prime_sieve_wasm');
-	});
-
 	function runSieve() {
-		if (!wasm) return;
 		const t0 = performance.now();
 		primes = wasm.primes_up_to(limit);
 		elapsed = (performance.now() - t0).toFixed(2);
@@ -25,7 +17,6 @@
 	}
 
 	function checkPrime() {
-		if (!wasm) return;
 		isPrimeResult = wasm.is_prime(checkTarget);
 	}
 
@@ -49,9 +40,6 @@
 		<p class="subtitle">
 			Sieve of Eratosthenes running in WebAssembly, written in Rust, rendered by Svelte 5.
 		</p>
-		{#if !wasm}
-			<p class="loading">Loading WASM module...</p>
-		{/if}
 	</header>
 
 	<section class="card">
@@ -63,7 +51,7 @@
 				Limit
 				<input type="number" bind:value={limit} min="2" max="10000000" step="1000" />
 			</label>
-			<button onclick={runSieve} disabled={!wasm}>Run sieve</button>
+			<button onclick={runSieve}>Run sieve</button>
 		</div>
 
 		{#if primes}
@@ -100,7 +88,7 @@
 				Number
 				<input type="number" bind:value={checkTarget} min="0" />
 			</label>
-			<button onclick={checkPrime} disabled={!wasm}>Check</button>
+			<button onclick={checkPrime}>Check</button>
 		</div>
 
 		{#if isPrimeResult !== null}
@@ -157,12 +145,6 @@
 		margin: 0;
 		color: #888;
 		font-size: 0.95rem;
-	}
-
-	.loading {
-		margin-top: 0.75rem;
-		color: #f59e0b;
-		font-size: 0.875rem;
 	}
 
 	.card {

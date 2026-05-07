@@ -476,6 +476,8 @@ dependencies = [
  "nix 0.29.0",
  "notify",
  "serde",
+ "serde_json",
+ "syn",
  "tempfile",
  "thiserror",
  "toml",

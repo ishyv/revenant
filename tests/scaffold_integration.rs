@@ -35,8 +35,5 @@ fn scaffold_creates_expected_structure() {
 
     // Verify revenant.toml parses correctly
     let config: toml::Value = toml::from_str(&toml_content).unwrap();
-    assert_eq!(
-        config["project"]["name"].as_str().unwrap(),
-        "test-project"
-    );
+    assert_eq!(config["project"]["name"].as_str().unwrap(), "test-project");
 }

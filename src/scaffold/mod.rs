@@ -5,7 +5,13 @@ pub mod templates;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::config::{RUST_SUBDIR, WEB_SUBDIR};
+use crate::config::{RUST_SUBDIR, WEB_SUBDIR, wasm_package_name};
+
+fn substitute(template: &str, project_name: &str) -> String {
+    template
+        .replace("{project_name}", project_name)
+        .replace("{wasm_name}", &wasm_package_name(project_name))
+}
 
 /// Create the full project directory tree and write all scaffold files.
 pub fn create_project(root: &Path, name: &str) -> Result<()> {
@@ -29,49 +35,49 @@ pub fn create_project(root: &Path, name: &str) -> Result<()> {
     let files: Vec<(std::path::PathBuf, String)> = vec![
         (
             root.join("revenant.toml"),
-            templates::REVENANT_TOML.replace("{project_name}", name),
+            substitute(templates::REVENANT_TOML, name),
         ),
         (
             root.join(RUST_SUBDIR).join("Cargo.toml"),
-            templates::RUST_CARGO_TOML.replace("{project_name}", name),
+            substitute(templates::RUST_CARGO_TOML, name),
         ),
         (
             root.join(RUST_SUBDIR).join("src").join("lib.rs"),
-            templates::RUST_LIB_RS.replace("{project_name}", name),
+            substitute(templates::RUST_LIB_RS, name),
         ),
         (
             root.join(WEB_SUBDIR).join("package.json"),
-            templates::WEB_PACKAGE_JSON.replace("{project_name}", name),
+            substitute(templates::WEB_PACKAGE_JSON, name),
         ),
         (
             root.join(WEB_SUBDIR).join("svelte.config.js"),
-            templates::WEB_SVELTE_CONFIG.replace("{project_name}", name),
+            substitute(templates::WEB_SVELTE_CONFIG, name),
         ),
         (
             root.join(WEB_SUBDIR).join("vite.config.js"),
-            templates::WEB_VITE_CONFIG.replace("{project_name}", name),
+            substitute(templates::WEB_VITE_CONFIG, name),
         ),
         (
             root.join(WEB_SUBDIR).join("src").join("app.html"),
-            templates::WEB_APP_HTML.replace("{project_name}", name),
+            substitute(templates::WEB_APP_HTML, name),
         ),
         (
             root.join(WEB_SUBDIR)
                 .join("src")
                 .join("routes")
                 .join("+page.svelte"),
-            templates::WEB_PAGE_SVELTE.replace("{project_name}", name),
+            substitute(templates::WEB_PAGE_SVELTE, name),
         ),
         (
             root.join(WEB_SUBDIR)
                 .join("src")
                 .join("lib")
                 .join("wasm.ts"),
-            templates::WEB_WASM_TS.replace("{project_name}", name),
+            substitute(templates::WEB_WASM_TS, name),
         ),
         (
             root.join("GETTING_STARTED.md"),
-            templates::GETTING_STARTED_MD.replace("{project_name}", name),
+            substitute(templates::GETTING_STARTED_MD, name),
         ),
     ];
 
