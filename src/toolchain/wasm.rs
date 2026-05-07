@@ -41,7 +41,14 @@ impl WasmBuilder for WasmPackBuilder {
         process::run_blocking(
             &self.rust_dir,
             "wasm-pack",
-            &["build", "--dev", "--target", &self.target, "--out-dir", &out],
+            &[
+                "build",
+                "--dev",
+                "--target",
+                &self.target,
+                "--out-dir",
+                &out,
+            ],
             self.verbose,
         )
         .map_err(|e| anyhow::anyhow!(RevenantError::WasmBuildFailed).context(e))

@@ -2,7 +2,8 @@
 
 A CLI that scaffolds and drives Rust/WebAssembly + SvelteKit projects. Write
 logic in Rust, compile to WASM, and consume it from Svelte 5 — one tool
-manages the entire build loop.
+manages the entire build loop, including a generated TypeScript facade that
+hides the raw `wasm-bindgen` package.
 
 <div align="center">
   <img src="./imgs/image.png" alt="Revenant" width="200"/>
@@ -49,13 +50,15 @@ automatically.
 ### `revenant dev`
 
 Runs an initial WASM build, starts a file watcher on `rust/src/`, and launches
-the SvelteKit dev server. Rust changes trigger automatic WASM rebuilds.
+the SvelteKit dev server. Rust changes trigger automatic WASM rebuilds plus
+regeneration of `web/src/lib/wasm.ts` and `pkg/revenant.contract.json`.
 Ctrl+C cleanly stops all processes.
 
 ### `revenant build`
 
 Production build: `wasm-pack build --release` followed by `npm run build`.
-Fails fast if either step errors.
+Before the web build, Revenant regenerates the typed Svelte facade from the
+Rust exports. Fails fast if either step errors.
 
 ### `revenant setup`
 
@@ -82,12 +85,14 @@ my-app/
     ├── vite.config.js    # wasm plugin + path alias to pkg/
     └── src/
         ├── app.html
-        ├── lib/wasm.ts   # placeholder for future typed re-exports
+        ├── lib/wasm.ts   # generated typed facade; import this, not pkg/
         └── routes/
-            └── +page.svelte  # imports WASM module on mount
+            └── +page.svelte  # imports from $lib/wasm
 ```
 
-WASM output goes to `pkg/` at the project root. `vite-plugin-wasm` and
+WASM output goes to `pkg/` at the project root, alongside
+`pkg/revenant.contract.json` — the intermediate contract manifest Revenant
+derives from `rust/src/lib.rs`. `vite-plugin-wasm` and
 `vite-plugin-top-level-await` handle browser-side loading.
 
 ## Roadmap

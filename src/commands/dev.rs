@@ -6,6 +6,7 @@ use colored::Colorize;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::bindings;
 use crate::config::{self, RevenantConfig, WEB_SUBDIR};
 use crate::errors::RevenantError;
 use crate::toolchain::process::{self, LogLine, ManagedProcess};
@@ -45,6 +46,8 @@ pub fn run(verbose: bool) -> Result<()> {
     println!("  {} Running initial WASM build...", "▸".cyan().bold());
     let builder = WasmPackBuilder::new(&root, &config.toolchain.wasm_target, verbose);
     builder.build_dev()?;
+    bindings::sync_bindings(&root, &config.project.name)
+        .context("failed to generate Revenant bindings after the initial WASM build")?;
     println!("  {} WASM build complete", "✓".green().bold());
 
     // Step 2: Start file watcher for rust/src/
@@ -111,9 +114,9 @@ pub fn run(verbose: bool) -> Result<()> {
             if !status.success() {
                 // Detect port-in-use if the server crashed quickly
                 if loop_start.elapsed() < Duration::from_secs(3) {
-                    let port_conflict = stderr_lines.iter().any(|l| {
-                        l.contains("EADDRINUSE") || l.contains("address already in use")
-                    });
+                    let port_conflict = stderr_lines
+                        .iter()
+                        .any(|l| l.contains("EADDRINUSE") || l.contains("address already in use"));
                     if port_conflict {
                         return Err(RevenantError::DevServerCrashed.into());
                     }
@@ -132,6 +135,12 @@ pub fn run(verbose: bool) -> Result<()> {
             && let Ok(Some(status)) = proc.try_wait()
         {
             if status.success() {
+                if let Err(err) = bindings::sync_bindings(&root, &config.project.name) {
+                    eprintln!(
+                        "  {} Failed to regenerate bindings: {err}",
+                        "✗".red().bold()
+                    );
+                }
                 println!("  {} WASM rebuild complete", "✓".green().bold());
             } else {
                 eprintln!("  {} WASM rebuild failed", "✗".red().bold());
@@ -152,10 +161,7 @@ pub fn run(verbose: bool) -> Result<()> {
 
             match wasm::spawn_wasm_build(&root, &config.toolchain.wasm_target, log_tx.clone()) {
                 Ok(proc) => wasm_proc = Some(proc),
-                Err(e) => eprintln!(
-                    "  {} Failed to start WASM rebuild: {e}",
-                    "✗".red().bold()
-                ),
+                Err(e) => eprintln!("  {} Failed to start WASM rebuild: {e}", "✗".red().bold()),
             }
         }
 

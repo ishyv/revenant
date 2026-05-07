@@ -20,11 +20,7 @@ pub fn run() -> Result<()> {
             println!("  {} {} found", "✓".green().bold(), tool.display_name());
         } else {
             all_ok = false;
-            println!(
-                "  {} {} not found",
-                "✗".red().bold(),
-                tool.display_name()
-            );
+            println!("  {} {} not found", "✗".red().bold(), tool.display_name());
             println!();
             print_install_instructions(*tool);
             println!();
@@ -117,7 +113,9 @@ fn print_install_instructions(tool: Tool) {
         (Tool::Node | Tool::Npm, _) => {
             println!("    Install Node.js (includes npm):");
             println!("      https://nodejs.org");
-            println!("      Or via your package manager (apt install nodejs, pacman -S nodejs, etc.)");
+            println!(
+                "      Or via your package manager (apt install nodejs, pacman -S nodejs, etc.)"
+            );
         }
     }
 }

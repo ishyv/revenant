@@ -9,6 +9,7 @@ Revenant is a CLI tool that bridges Rust/WebAssembly and SvelteKit, providing
 src/
 ├── main.rs              Clap CLI dispatch + error display
 ├── lib.rs               Public module re-exports (enables integration tests)
+├── bindings.rs          Rust -> TypeScript contract extraction + facade generation
 ├── config.rs            RevenantConfig, revenant.toml I/O, named constants
 ├── errors.rs            RevenantError enum (thiserror)
 ├── commands/
@@ -76,13 +77,12 @@ processes.
 
 ### No template engine
 
-All scaffold templates are `const &str` in `templates.rs` with `{project_name}`
-placeholders replaced via `String::replace()`. There is exactly one variable
-across all templates.
+All scaffold templates are `const &str` in `templates.rs` with a tiny string
+substitution layer for `{project_name}` and `{wasm_name}`.
 
-The tradeoff: adding a second variable would require editing every template
-constant. If v2 template variants (minimal, full) need conditional sections,
-a proper template engine may become worthwhile.
+The tradeoff: adding conditionals or loops would still be clumsy. If v2
+template variants (minimal, full) need conditional sections, a proper template
+engine may become worthwhile.
 
 ### File watching
 
@@ -93,6 +93,25 @@ process on each change.
 Debouncing happens inside the `notify` callback, not in the consumer. A single
 file save can fire 3-5 filesystem events; debouncing at the source prevents
 redundant rebuild signals.
+
+### Generated bindings
+
+After every successful WASM build, Revenant reads `rust/src/lib.rs`, extracts a
+contract from public `#[wasm_bindgen]` exports, writes that manifest to
+`pkg/revenant.contract.json`, and regenerates `web/src/lib/wasm.ts`.
+
+The current bridge strategy is deliberately strict:
+
+- **Supported runtime surface**: primitives, `String`, and typed numeric
+  vectors that `wasm-bindgen` already exposes cleanly.
+- **Supported contract surface**: the manifest understands richer Rust shapes
+  like `Option<T>`, `Result<T, E>`, tuples, structs, and enums.
+- **Failure mode**: if an exported function uses a type the TypeScript contract
+  can describe but the runtime bridge cannot preserve yet, Revenant fails the
+  build with an explicit error instead of emitting `unknown` or `any`.
+
+This keeps the public Svelte API stable and invisible while leaving room for a
+future serialized bridge behind the same generated facade.
 
 ### Error handling
 
@@ -175,7 +194,7 @@ backend without changing command logic.
 - `commands/dev.rs` — Vite plugin replacing the watcher
 - `config.rs` — optional fields (wasi_target, custom watch paths, build flags)
 - `scaffold/mod.rs` — template variants via `--template` flag
-- `scaffold/templates.rs` — auto-generated typed re-exports
+- `bindings.rs` — richer bridge strategies beyond direct `wasm-bindgen` exports
 - `toolchain/detect.rs` — pnpm/yarn/bun support
 - `toolchain/wasm.rs` — WasiBuilder variant
 
@@ -192,7 +211,7 @@ sequence.
 | Decision | Benefit | Cost |
 |----------|---------|------|
 | No async | Simpler code, fewer deps | 100ms polling tick |
-| No template engine | Zero deps for templates | One variable only; adding more is manual |
+| No template engine | Zero deps for templates | String substitution only; richer templates stay manual |
 | Upfront tool checks | Single error, no partial state | Checks tools not immediately needed |
 | Auto-install wasm-pack only | Pragmatic UX win | Inconsistent with "no auto-install" principle |
 | Windows `cmd /C` | npm works on Windows | Extra process in tree |

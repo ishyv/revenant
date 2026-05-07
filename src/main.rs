@@ -4,7 +4,11 @@ use colored::Colorize;
 use revenant::commands;
 
 #[derive(Parser)]
-#[command(name = "revenant", version, about = "Rust/WASM + SvelteKit development tool")]
+#[command(
+    name = "revenant",
+    version,
+    about = "Rust/WASM + SvelteKit development tool"
+)]
 struct Cli {
     /// Show full child process output
     #[arg(long, global = true)]

@@ -10,6 +10,10 @@ pub const WASM_PACK_TARGET: &str = "bundler";
 pub const DEBOUNCE_MS: u64 = 500;
 pub const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
+pub fn wasm_package_name(project_name: &str) -> String {
+    format!("{}_wasm", project_name.replace('-', "_"))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RevenantConfig {
     pub project: ProjectConfig,
@@ -99,7 +103,10 @@ pkg_manager = "npm"
     fn find_project_root_in_current_dir() {
         let tmp = TempDir::new().unwrap();
         write_valid_config(tmp.path());
-        assert_eq!(find_project_root(tmp.path()), Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            find_project_root(tmp.path()),
+            Some(tmp.path().to_path_buf())
+        );
     }
 
     #[test]

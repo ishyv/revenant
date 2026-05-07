@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 
+use crate::bindings;
 use crate::config::{self, RevenantConfig, WEB_SUBDIR};
 use crate::errors::RevenantError;
 use crate::toolchain::process;
@@ -31,12 +32,19 @@ pub fn run(verbose: bool) -> Result<()> {
     // Step 1: WASM release build
     println!("  {} Building WASM (release)...", "▸".green().bold());
     builder.build_release()?;
+    bindings::sync_bindings(&root, &config.project.name)
+        .context("failed to generate Revenant bindings after the WASM build")?;
     println!("  {} WASM build complete", "✓".green().bold());
 
     // Step 2: Web build
     println!("  {} Building web app...", "▸".green().bold());
-    process::run_blocking(&web_dir, &config.toolchain.pkg_manager, &["run", "build"], verbose)
-        .context(RevenantError::WebBuildFailed)?;
+    process::run_blocking(
+        &web_dir,
+        &config.toolchain.pkg_manager,
+        &["run", "build"],
+        verbose,
+    )
+    .context(RevenantError::WebBuildFailed)?;
     println!("  {} Web build complete", "✓".green().bold());
 
     println!();

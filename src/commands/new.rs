@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::Path;
 
+use crate::bindings;
 use crate::config::WEB_SUBDIR;
 use crate::errors::RevenantError;
 use crate::scaffold;
-use crate::toolchain::detect::{require_tools, Tool};
+use crate::toolchain::detect::{Tool, require_tools};
 use crate::toolchain::process;
 
 /// Validate a project name: no slashes, spaces, or leading dots.
@@ -60,6 +61,8 @@ pub fn run(name: &str, verbose: bool) -> Result<()> {
 
     scaffold::create_project(target, name)
         .with_context(|| format!("failed to scaffold project '{name}'"))?;
+    bindings::sync_bindings(target, name)
+        .context("failed to generate the initial Revenant bindings")?;
 
     println!("  {} Project scaffolded", "✓".green().bold());
 
