@@ -73,6 +73,7 @@ pub fn run(verbose: bool) -> Result<()> {
     // Track in-flight wasm-pack rebuild process
     let mut wasm_proc: Option<ManagedProcess> = None;
     let loop_start = Instant::now();
+    let mut loop_error: Option<anyhow::Error> = None;
 
     // Event loop
     loop {
@@ -113,19 +114,17 @@ pub fn run(verbose: bool) -> Result<()> {
 
             if !status.success() {
                 // Detect port-in-use if the server crashed quickly
-                if loop_start.elapsed() < Duration::from_secs(3) {
-                    let port_conflict = stderr_lines
+                let port_conflict = loop_start.elapsed() < Duration::from_secs(3)
+                    && stderr_lines
                         .iter()
                         .any(|l| l.contains("EADDRINUSE") || l.contains("address already in use"));
-                    if port_conflict {
-                        return Err(RevenantError::DevServerCrashed.into());
-                    }
-                }
 
-                let code = status.code().unwrap_or(-1);
-                return Err(anyhow::anyhow!(
-                    "dev server exited with code {code} — check output above"
-                ));
+                loop_error = Some(if port_conflict {
+                    RevenantError::DevServerCrashed.into()
+                } else {
+                    let code = status.code().unwrap_or(-1);
+                    anyhow::anyhow!("dev server exited with code {code} — check output above")
+                });
             }
             break;
         }
@@ -177,5 +176,9 @@ pub fn run(verbose: bool) -> Result<()> {
     web_proc.terminate_with_timeout();
 
     println!("  {} All processes stopped", "✓".green().bold());
-    Ok(())
+
+    match loop_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }

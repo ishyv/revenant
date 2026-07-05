@@ -51,7 +51,7 @@ impl WasmBuilder for WasmPackBuilder {
             ],
             self.verbose,
         )
-        .map_err(|e| anyhow::anyhow!(RevenantError::WasmBuildFailed).context(e))
+        .context(RevenantError::WasmBuildFailed)
     }
 
     fn build_release(&self) -> Result<()> {
@@ -69,7 +69,7 @@ impl WasmBuilder for WasmPackBuilder {
             ],
             self.verbose,
         )
-        .map_err(|e| anyhow::anyhow!(RevenantError::WasmBuildFailed).context(e))
+        .context(RevenantError::WasmBuildFailed)
     }
 }
 

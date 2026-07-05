@@ -95,6 +95,16 @@ WASM output goes to `pkg/` at the project root, alongside
 derives from `rust/src/lib.rs`. `vite-plugin-wasm` and
 `vite-plugin-top-level-await` handle browser-side loading.
 
+## Known Limitations
+
+The generated TypeScript facade only bridges what `wasm-bindgen` can expose
+cleanly at runtime today: primitives, `String`, and typed numeric vectors
+(`Vec<i32>`, `Vec<f64>`, etc.). Exported functions using `Vec<String>`,
+custom structs, or other richer shapes will fail bindings generation with an
+explicit error rather than silently producing a broken facade — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#generated-bindings) for the full
+bridge strategy.
+
 ## Roadmap
 
 **v2** — Vite plugin that triggers `wasm-pack` on import resolution, replacing

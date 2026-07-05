@@ -99,6 +99,7 @@ fn print_install_instructions(tool: Tool) {
         (Tool::WasmPack, _) => {
             println!("    Install wasm-pack:");
             println!("      cargo install wasm-pack");
+            println!("      (or skip this — 'revenant new'/'revenant dev' auto-install it for you)");
         }
         (Tool::Node | Tool::Npm, "windows") => {
             println!("    Install Node.js (includes npm):");

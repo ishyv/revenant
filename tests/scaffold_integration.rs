@@ -7,7 +7,9 @@ fn scaffold_creates_expected_structure() {
 
     revenant::scaffold::create_project(&project_dir, "test-project").unwrap();
 
-    // All 10 template files must exist
+    // All 9 template files must exist. `web/src/lib/wasm.ts` is not among
+    // them — it's written by `bindings::sync_bindings` after the first WASM
+    // build, not by scaffolding.
     let expected_files = [
         "revenant.toml",
         "rust/Cargo.toml",
@@ -17,7 +19,6 @@ fn scaffold_creates_expected_structure() {
         "web/vite.config.js",
         "web/src/app.html",
         "web/src/routes/+page.svelte",
-        "web/src/lib/wasm.ts",
         "GETTING_STARTED.md",
     ];
 
@@ -27,6 +28,11 @@ fn scaffold_creates_expected_structure() {
             "expected file missing: {file}"
         );
     }
+
+    assert!(
+        !project_dir.join("web/src/lib/wasm.ts").exists(),
+        "wasm.ts should not exist until bindings::sync_bindings runs"
+    );
 
     // Verify substitution happened — no raw placeholders
     let toml_content = std::fs::read_to_string(project_dir.join("revenant.toml")).unwrap();

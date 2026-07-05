@@ -3,13 +3,13 @@ use colored::Colorize;
 use std::path::Path;
 
 use crate::bindings;
-use crate::config::WEB_SUBDIR;
+use crate::config::{RevenantConfig, WEB_SUBDIR};
 use crate::errors::RevenantError;
 use crate::scaffold;
 use crate::toolchain::detect::{Tool, require_tools};
 use crate::toolchain::process;
 
-/// Validate a project name: no slashes, spaces, or leading dots.
+/// Validate a project name: alphanumeric characters, hyphens, and underscores only.
 fn validate_name(name: &str) -> Result<(), RevenantError> {
     if name.is_empty() {
         return Err(RevenantError::InvalidProjectName {
@@ -23,16 +23,14 @@ fn validate_name(name: &str) -> Result<(), RevenantError> {
             reason: "name cannot start with a dot".to_string(),
         });
     }
-    if name.contains('/') || name.contains('\\') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(RevenantError::InvalidProjectName {
             name: name.to_string(),
-            reason: "name cannot contain slashes".to_string(),
-        });
-    }
-    if name.contains(' ') {
-        return Err(RevenantError::InvalidProjectName {
-            name: name.to_string(),
-            reason: "name cannot contain spaces".to_string(),
+            reason: "name must contain only alphanumeric characters, hyphens, and underscores"
+                .to_string(),
         });
     }
     Ok(())
@@ -41,7 +39,7 @@ fn validate_name(name: &str) -> Result<(), RevenantError> {
 /// Scaffold a new Revenant project with the given name.
 ///
 /// Validates the name, checks for required tools, writes the project template,
-/// and runs `npm install` in the web directory.
+/// and installs web dependencies in the web directory.
 pub fn run(name: &str, verbose: bool) -> Result<()> {
     validate_name(name)?;
 
@@ -66,11 +64,20 @@ pub fn run(name: &str, verbose: bool) -> Result<()> {
 
     println!("  {} Project scaffolded", "✓".green().bold());
 
+    let config = RevenantConfig::load(target)
+        .with_context(|| format!("failed to load revenant.toml for '{name}'"))?;
+
     // Install web dependencies immediately so the project is ready to use
     let web_dir = target.join(WEB_SUBDIR);
     println!("  {} Installing web dependencies...", "▸".green().bold());
-    process::run_blocking(&web_dir, "npm", &["install"], verbose)
-        .with_context(|| format!("npm install failed in {}", web_dir.display()))?;
+    process::run_blocking(&web_dir, &config.toolchain.pkg_manager, &["install"], verbose)
+        .with_context(|| {
+            format!(
+                "{} install failed in {}",
+                config.toolchain.pkg_manager,
+                web_dir.display()
+            )
+        })?;
     println!("  {} Dependencies installed", "✓".green().bold());
 
     println!();
@@ -123,5 +130,16 @@ mod tests {
     fn spaces_rejected() {
         let err = validate_name("my app").unwrap_err();
         assert!(matches!(err, RevenantError::InvalidProjectName { .. }));
+    }
+
+    #[test]
+    fn special_characters_rejected() {
+        for name in ["My@App!", "app.name", "app+plus"] {
+            let err = validate_name(name).unwrap_err();
+            assert!(
+                matches!(err, RevenantError::InvalidProjectName { .. }),
+                "expected '{name}' to be rejected"
+            );
+        }
     }
 }

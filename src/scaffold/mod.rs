@@ -69,13 +69,6 @@ pub fn create_project(root: &Path, name: &str) -> Result<()> {
             substitute(templates::WEB_PAGE_SVELTE, name),
         ),
         (
-            root.join(WEB_SUBDIR)
-                .join("src")
-                .join("lib")
-                .join("wasm.ts"),
-            substitute(templates::WEB_WASM_TS, name),
-        ),
-        (
             root.join("GETTING_STARTED.md"),
             substitute(templates::GETTING_STARTED_MD, name),
         ),
