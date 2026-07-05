@@ -21,7 +21,7 @@ correctly, so you can focus on code.
 
 ## Requirements
 
-- **Rust** (with `cargo`) — [rustup.rs](https://rustup.rs)
+- **Rust 1.85+** (with `cargo`) — [rustup.rs](https://rustup.rs)
 - **Node.js 18+** (with `npm`) — [nodejs.org](https://nodejs.org)
 - **wasm-pack** — auto-installed via `cargo install wasm-pack` if missing
 

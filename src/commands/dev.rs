@@ -123,7 +123,7 @@ pub fn run(verbose: bool) -> Result<()> {
                     RevenantError::DevServerCrashed.into()
                 } else {
                     let code = status.code().unwrap_or(-1);
-                    anyhow::anyhow!("dev server exited with code {code} — check output above")
+                    RevenantError::DevServerExited(code).into()
                 });
             }
             break;

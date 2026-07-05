@@ -22,7 +22,13 @@ fn make_command(program: &str) -> Command {
     }
     #[cfg(not(windows))]
     {
-        Command::new(program)
+        let mut cmd = Command::new(program);
+        // DESIGN: put the child in its own process group so terminate_with_timeout
+        // can signal the whole tree (e.g. `npm run dev`'s vite/node grandchildren)
+        // via killpg instead of leaving them orphaned when only the direct child
+        // (npm) is signaled.
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        cmd
     }
 }
 
@@ -37,8 +43,8 @@ pub struct LogLine {
 /// A child process with I/O pump threads that forward stdout/stderr to a channel.
 pub struct ManagedProcess {
     child: Child,
-    _stdout_thread: Option<thread::JoinHandle<()>>,
-    _stderr_thread: Option<thread::JoinHandle<()>>,
+    stdout_thread: Option<thread::JoinHandle<()>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl ManagedProcess {
@@ -64,7 +70,7 @@ impl ManagedProcess {
 
         let prefix_owned = prefix.to_string();
         let tx1 = log_tx.clone();
-        let _stdout_thread = stdout.map(|out| {
+        let stdout_thread = stdout.map(|out| {
             let prefix = prefix_owned.clone();
             thread::spawn(move || {
                 let reader = BufReader::new(out);
@@ -80,7 +86,7 @@ impl ManagedProcess {
         });
 
         let tx2 = log_tx;
-        let _stderr_thread = stderr.map(|err| {
+        let stderr_thread = stderr.map(|err| {
             let prefix = prefix_owned;
             thread::spawn(move || {
                 let reader = BufReader::new(err);
@@ -97,8 +103,8 @@ impl ManagedProcess {
 
         Ok(Self {
             child,
-            _stdout_thread,
-            _stderr_thread,
+            stdout_thread,
+            stderr_thread,
         })
     }
 
@@ -109,39 +115,71 @@ impl ManagedProcess {
             .context("failed to check process status")
     }
 
-    /// Terminate the process gracefully, escalating to kill after timeout.
+    /// Terminate the process (and its children) gracefully, escalating to a
+    /// forceful kill after timeout.
     pub fn terminate_with_timeout(&mut self) {
-        // On Windows, there is no SIGTERM — just kill
+        // On Windows, `self.child` is the `cmd /C` wrapper (see `make_command`),
+        // so killing it directly leaves the real program (npm/vite/node) running.
+        // `taskkill /T` kills the whole process tree instead.
         #[cfg(windows)]
         {
-            let _ = self.child.kill();
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.child.id().to_string(), "/T", "/F"])
+                .output();
         }
 
-        // On Unix, send SIGTERM first, then SIGKILL after timeout
+        // On Unix, the child was placed in its own process group (see
+        // `make_command`), so signaling the group reaches grandchildren
+        // (e.g. vite/node forked by npm) too, not just the direct child.
         #[cfg(unix)]
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
 
-            let pid = Pid::from_raw(self.child.id() as i32);
-            let _ = signal::kill(pid, Signal::SIGTERM);
+            let pgid = Pid::from_raw(self.child.id() as i32);
+            let _ = signal::killpg(pgid, Signal::SIGTERM);
         }
 
         // Wait up to SHUTDOWN_TIMEOUT_SECS for the process to exit
         let deadline = std::time::Instant::now() + Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => break,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
+                        #[cfg(unix)]
+                        {
+                            use nix::sys::signal::{self, Signal};
+                            use nix::unistd::Pid;
+                            let pgid = Pid::from_raw(self.child.id() as i32);
+                            let _ = signal::killpg(pgid, Signal::SIGKILL);
+                        }
                         let _ = self.child.kill();
                         let _ = self.child.wait();
-                        return;
+                        break;
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
-                Err(_) => return,
+                Err(_) => break,
             }
+        }
+
+        if let Some(handle) = self.stdout_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ManagedProcess {
+    /// Structural safety net: if a `ManagedProcess` is ever dropped without an
+    /// explicit `terminate_with_timeout()` call (e.g. a future early-return
+    /// bug), don't leak the child process instead of silently orphaning it.
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            self.terminate_with_timeout();
         }
     }
 }
@@ -194,5 +232,72 @@ pub fn run_blocking(working_dir: &Path, program: &str, args: &[&str], verbose: b
                 )
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// True if `pid` is running and not a zombie. `kill(pid, 0)` alone isn't
+    /// enough on Linux: a terminated-but-not-yet-reaped process still holds its
+    /// pid slot and answers signal 0 until its (possibly reparented) parent
+    /// reaps it, which can lag briefly — check `/proc` state to look past that.
+    fn process_alive(pid: i32) -> bool {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        if kill(Pid::from_raw(pid), None).is_err() {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .is_some_and(|state| state != "Z"),
+            Err(_) => true,
+        }
+    }
+
+    /// Regression test for the orphaned-grandchild bug: `npm run dev` forking
+    /// `vite`/`node` as a grandchild used to survive `terminate_with_timeout`,
+    /// since only the direct child was signaled. The process-group fix in
+    /// `make_command`/`terminate_with_timeout` should reap the whole tree.
+    #[test]
+    fn terminate_with_timeout_kills_grandchildren() {
+        let (tx, _rx) = mpsc::channel();
+        let pid_file =
+            std::env::temp_dir().join(format!("revenant_test_grandchild_{}", std::process::id()));
+        let script = format!("sleep 5 & echo $! > {} ; wait", pid_file.display());
+
+        let mut proc =
+            ManagedProcess::spawn(Path::new("."), "sh", &["-c", &script], "test", tx).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut grandchild_pid = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = contents.trim().parse::<i32>()
+            {
+                grandchild_pid = Some(pid);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let grandchild_pid = grandchild_pid.expect("grandchild pid should have been written");
+        assert!(
+            process_alive(grandchild_pid),
+            "grandchild should be running before termination"
+        );
+
+        proc.terminate_with_timeout();
+        thread::sleep(Duration::from_millis(500));
+
+        assert!(
+            !process_alive(grandchild_pid),
+            "grandchild should be dead after terminate_with_timeout"
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
     }
 }

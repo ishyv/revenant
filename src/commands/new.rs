@@ -70,14 +70,19 @@ pub fn run(name: &str, verbose: bool) -> Result<()> {
     // Install web dependencies immediately so the project is ready to use
     let web_dir = target.join(WEB_SUBDIR);
     println!("  {} Installing web dependencies...", "▸".green().bold());
-    process::run_blocking(&web_dir, &config.toolchain.pkg_manager, &["install"], verbose)
-        .with_context(|| {
-            format!(
-                "{} install failed in {}",
-                config.toolchain.pkg_manager,
-                web_dir.display()
-            )
-        })?;
+    process::run_blocking(
+        &web_dir,
+        &config.toolchain.pkg_manager,
+        &["install"],
+        verbose,
+    )
+    .with_context(|| {
+        format!(
+            "{} install failed in {}",
+            config.toolchain.pkg_manager,
+            web_dir.display()
+        )
+    })?;
     println!("  {} Dependencies installed", "✓".green().bold());
 
     println!();

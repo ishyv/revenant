@@ -142,6 +142,12 @@ pub fn build_manifest(source: &str) -> Result<ContractManifest> {
                 raw_defs.insert(item.ident.to_string(), RawTypeDef::Enum(item));
             }
             Item::Fn(item) if is_wasm_bindgen_export(&item) => exports.push(item),
+            Item::Impl(item) if has_wasm_bindgen_attr(&item.attrs) => {
+                anyhow::bail!(
+                    "found a #[wasm_bindgen] impl block. Revenant does not support struct \
+                     methods yet — expose free `pub fn` functions instead."
+                );
+            }
             _ => {}
         }
     }
@@ -401,7 +407,20 @@ fn is_wasm_bindgen_export(item: &ItemFn) -> bool {
         return false;
     }
 
-    item.attrs.iter().any(|attr| {
+    has_wasm_bindgen_attr(&item.attrs)
+}
+
+/// True if `generics` has any type or const parameter. Lifetime-only generics
+/// (e.g. `fn greet<'a>(name: &'a str) -> &'a str`) are bridgeable and don't count.
+fn has_non_lifetime_generics(generics: &syn::Generics) -> bool {
+    generics
+        .params
+        .iter()
+        .any(|p| !matches!(p, syn::GenericParam::Lifetime(_)))
+}
+
+fn has_wasm_bindgen_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
         attr.path()
             .segments
             .last()
@@ -429,7 +448,7 @@ impl ManifestBuilder {
     }
 
     fn export_from_fn(&mut self, item: &ItemFn) -> Result<ExportContract> {
-        if !item.sig.generics.params.is_empty() {
+        if has_non_lifetime_generics(&item.sig.generics) {
             anyhow::bail!(
                 "export '{}' uses generics. Revenant cannot infer stable TypeScript bindings for generic exports.",
                 item.sig.ident
@@ -503,6 +522,8 @@ impl ManifestBuilder {
                     .collect::<Result<Vec<_>>>()?,
             }),
             Type::Paren(paren) => self.resolve_type(&paren.elem),
+            // TODO(v2): explore richer bridge strategies for currently-unsupported
+            // shapes (slices, arrays, Vec<String>, structs-by-value, etc.)
             _ => anyhow::bail!(
                 "unsupported Rust type '{}'. Revenant currently understands primitives, String, Vec<T>, Option<T>, Result<T, E>, tuples, and named structs/enums.",
                 type_to_string(ty)
@@ -592,7 +613,7 @@ impl ManifestBuilder {
 
     fn resolve_struct(&mut self, item: ItemStruct) -> Result<TypeDefinition> {
         let name = item.ident.to_string();
-        if !item.generics.params.is_empty() {
+        if has_non_lifetime_generics(&item.generics) {
             anyhow::bail!(
                 "struct '{}' is generic. Revenant cannot generate stable bindings for generic structs yet.",
                 name
@@ -630,7 +651,7 @@ impl ManifestBuilder {
 
     fn resolve_enum(&mut self, item: ItemEnum) -> Result<TypeDefinition> {
         let name = item.ident.to_string();
-        if !item.generics.params.is_empty() {
+        if has_non_lifetime_generics(&item.generics) {
             anyhow::bail!(
                 "enum '{}' is generic. Revenant cannot generate stable bindings for generic enums yet.",
                 name
@@ -743,6 +764,19 @@ fn type_to_string(ty: &Type) -> String {
                 .join(", ");
             format!("({items})")
         }
+        Type::Slice(slice) => format!("[{}]", type_to_string(&slice.elem)),
+        Type::Array(array) => format!("[{}; N]", type_to_string(&array.elem)),
+        Type::Ptr(ptr) => format!(
+            "*{} {}",
+            if ptr.mutability.is_some() {
+                "mut"
+            } else {
+                "const"
+            },
+            type_to_string(&ptr.elem)
+        ),
+        Type::BareFn(_) => "fn(...)".to_string(),
+        Type::TraitObject(_) => "dyn Trait".to_string(),
         _ => "unknown".to_string(),
     }
 }
@@ -844,6 +878,62 @@ pub fn save(payload: Payload) -> bool {
             err.to_string()
                 .contains("parameter 'payload' is not bridgeable")
         );
+    }
+
+    #[test]
+    fn lifetime_only_generics_are_bridgeable() {
+        let source = r#"
+use wasm_bindgen::prelude::*;
+
+pub struct Borrowed<'a> {
+    text: &'a str,
+}
+
+#[wasm_bindgen]
+pub fn greet<'a>(name: &'a str) -> String {
+    name.to_string()
+}
+"#;
+
+        let manifest = build_manifest(source).unwrap();
+        assert_eq!(manifest.exports.len(), 1);
+        assert_eq!(manifest.exports[0].name, "greet");
+    }
+
+    #[test]
+    fn wasm_bindgen_impl_block_fails_clearly() {
+        let source = r#"
+use wasm_bindgen::prelude::*;
+
+pub struct Counter {
+    value: u32,
+}
+
+#[wasm_bindgen]
+impl Counter {
+    pub fn new() -> Counter {
+        Counter { value: 0 }
+    }
+}
+"#;
+
+        let err = build_manifest(source).unwrap_err();
+        assert!(err.to_string().contains("#[wasm_bindgen] impl block"));
+    }
+
+    #[test]
+    fn unbridgeable_type_is_named_in_error() {
+        let source = r#"
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+pub fn checksum(data: &[u8]) -> u32 {
+    data.len() as u32
+}
+"#;
+
+        let err = build_manifest(source).unwrap_err();
+        assert!(err.to_string().contains("'[u8]'"), "got: {err}");
     }
 
     #[test]

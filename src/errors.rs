@@ -34,6 +34,9 @@ pub enum RevenantError {
         "dev server crashed unexpectedly. If the port is in use, stop other dev servers or set a custom port in web/vite.config.js"
     )]
     DevServerCrashed,
+
+    #[error("dev server exited with code {0} — check output above")]
+    DevServerExited(i32),
 }
 
 #[derive(Debug)]
