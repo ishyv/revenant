@@ -128,8 +128,15 @@ Every error message follows a three-part pattern:
 
 `ctrlc` with `termination` feature catches SIGINT/SIGTERM (+ Windows console
 events). The handler sends on an mpsc channel; the dev loop polls it.
-`terminate_with_timeout` sends SIGTERM on Unix (via `nix`) or `child.kill()` on
-Windows, then waits up to 5 seconds before escalating to SIGKILL.
+
+Children are killed as a whole tree, not just the direct process, since
+`npm run dev` commonly forks `vite`/`node` as grandchildren. On Unix, each
+child is spawned into its own process group (`CommandExt::process_group(0)`)
+and `terminate_with_timeout` sends SIGTERM via `nix::sys::signal::killpg` to
+the whole group. On Windows, where the tracked child is actually the
+`cmd /C` wrapper (see below), `taskkill /PID <pid> /T /F` kills the wrapper
+and everything it spawned. Either way, the process waits up to 5 seconds
+before escalating to a forceful kill (SIGKILL on Unix).
 
 ### Auto-install
 
@@ -179,7 +186,11 @@ automatically — it guides the user through each step.
 All tool invocations on Windows route through `cmd /C` to resolve `.cmd` shims
 (npm, npx). This adds one process to the tree but is necessary because
 `Command::new("npm")` fails on Windows where npm is a `.cmd` script, not a
-binary.
+binary. Because of this wrapping, the `ManagedProcess` child Revenant tracks
+is `cmd.exe`, not the real program — killing just that process would leave
+the actual npm/vite/node tree running, which is why `terminate_with_timeout`
+uses `taskkill /T` (see "Signal handling" above) instead of killing the
+wrapper directly.
 
 ## Extension Points
 
@@ -214,5 +225,5 @@ sequence.
 | No template engine | Zero deps for templates | String substitution only; richer templates stay manual |
 | Upfront tool checks | Single error, no partial state | Checks tools not immediately needed |
 | Auto-install wasm-pack only | Pragmatic UX win | Inconsistent with "no auto-install" principle |
-| Windows `cmd /C` | npm works on Windows | Extra process in tree |
+| Windows `cmd /C` | npm works on Windows | Extra process in tree; needs `taskkill /T` to clean up the whole tree, not a plain kill |
 | Two process models | Right tool for each job | Two code paths to maintain |
