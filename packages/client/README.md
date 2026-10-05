@@ -10,6 +10,9 @@ the generated Tauri host; package version 0.3 uses manifest version 3, protocol 
 The generated `$lib/revenant` facade supplies the compiled manifest and operation
 bindings. Its root should be created during parent component initialization.
 Components use child scopes so leaving a screen releases its native resources.
+Application layouts can import `setupApp` from `$lib/revenant` and call
+`setupApp()` during initialization; it creates the typed root, provides context,
+and owns teardown. Keep generated files as build outputs.
 The lower-level primitives used by that generated facade are:
 
 ```ts
@@ -34,6 +37,19 @@ ownership. `useApp()` resolves an existing ancestor context, while `useApp(root)
 uses an explicit generated root. Both own a native child scope until unmount.
 `useApp` also provides that child in its component context. Descendants inherit
 the nearest scoped app, so their native owners follow component ancestry.
+
+## Replaceable reads
+
+Use `const query = operation.query()` for explicit read requests. Subscribe to
+`query` as a Svelte store, and call `await query.load(input)`. Its snapshot has
+`status`, previous successful `data`, and a classified `error` on failure. New
+loads suppress earlier responses; `query.invalidate()` does so immediately
+while a debounced replacement is pending. Scope teardown releases native tasks
+and freezes publication. Keep mutations on `operation.call` or `run`.
+
+`OperationInput<typeof operation>` and `OperationOutput<typeof operation>` infer
+DTOs directly from generated operations. Query helpers do not alter the native
+protocol, scheduling, or cancellation acknowledgements.
 
 ## Folder windows and native selection
 

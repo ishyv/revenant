@@ -1,0 +1,8 @@
+version = 3
+[project]
+name = "image-notes"
+identifier = "app.revenant.image-notes"
+[desktop]
+title = "Luma — Image Notes"
+width = 1360
+height = 880

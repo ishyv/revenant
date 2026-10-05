@@ -1,4 +1,4 @@
-import type { App, FileEntry, OperationDefinition, ProviderDescriptor, Task } from '../src/index.js';
+import type { App, FileEntry, OperationDefinition, OperationInput, OperationOutput, ProviderDescriptor, Query, Task } from '../src/index.js';
 import { useApp } from '../src/svelte.js';
 
 type Input = { text: string };
@@ -8,6 +8,15 @@ declare const registration: OperationDefinition;
 const operation = app.bindOperation<Input, Output>(registration);
 const result: Promise<Output> = operation.call({ text: 'native' });
 const task: Task<Output> = operation.run({ text: 'native' });
+const query: Query<Input, Output> = operation.query();
+const queryInput: OperationInput<typeof operation> = { text: 'query' };
+const queryOutput: OperationOutput<typeof operation> = { length: 5 };
+const loading: Promise<void> = query.load(queryInput);
+// @ts-expect-error Query inputs preserve the compiled contract.
+void query.load({ text: 12 });
+// @ts-expect-error Output helpers preserve generated property types.
+const wrongOutput: OperationOutput<typeof operation> = { length: 'five' };
+void [queryOutput, loading, wrongOutput];
 // @ts-expect-error Compiled operation inputs retain the generated field type.
 operation.run({ text: 12 });
 // @ts-expect-error Native execution callbacks are not client provider APIs.

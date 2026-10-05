@@ -17,6 +17,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Tauri discovers plugin permissions from direct host dependencies.
+tauri-plugin-dialog = "2"
 revenant = { package = "revenant-sdk", version = "0.3.0", path = "../sdk/crates/revenant-sdk" }
 revenant-desktop = { version = "0.3.0", path = "../sdk/crates/revenant-desktop" }
 {{native_dependency}}

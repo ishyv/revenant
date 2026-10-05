@@ -4,6 +4,12 @@ import type { OperationDefinition } from "./contracts.js";
 import { validator } from "./schema.js";
 import { BatchResult, Task } from "./task.js";
 import type { Scope } from "./scope.js";
+import { Query } from "./query.js";
+
+/** Infer an operation's compiled input without repeating its wire contract. */
+export type OperationInput<T> = T extends Operation<infer I, infer _O> ? I : never;
+/** Infer an operation's compiled result without nesting Promise and method utility types. */
+export type OperationOutput<T> = T extends Operation<infer _I, infer O> ? O : never;
 /** Captured native files, native all-matching view, or a small JSON application-record batch. */
 export type NativeSelection = {
   /** Captured native selection identity whose leases are frozen at task admission. */
@@ -81,6 +87,10 @@ export class Operation<I, O> {
     finally {
       await task.dispose();
     }
+  }
+  /** Own an explicitly loaded, latest-result read projection in this operation's scope. */
+  query(): Query<I, O> {
+    return new Query(this);
   }
   /** Submit captured native inputs or an all-matching view without copying the file dataset. */
   runSelection(selection: () => Promise<NativeSelection>): Task<BatchResult<O>> {

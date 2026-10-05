@@ -47,6 +47,8 @@ fn immutable_generation_publishes_documented_types_and_rust_source() {
     let before = fs::read(first_path.join("facade.ts")).unwrap();
     let facade = String::from_utf8(before.clone()).unwrap();
     assert!(facade.contains("export namespace RecordsNormalize"));
+    assert!(facade.contains("export function setupApp("));
+    assert!(facade.contains("setupRuntimeApp(createApp(options))"));
     // TypeScript treats a same-line `{ /**` as a trailing comment rather than
     // documentation for the following operation property.
     assert!(!facade.contains("\"records\": { /**"));
