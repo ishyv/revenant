@@ -97,11 +97,36 @@ miniaturas: con la app cerrada puedes borrar únicamente `renditions/`.
 Revenant proporciona el selector de carpeta, los scopes, las operaciones tipadas,
 los trabajos/cancelación, la generación de contratos y el empaquetado Tauri.
 Luma añade SQLite/FTS5, identidad estable, escaneo/reconciliación, notas, caché de
-rendiciones y componentes de galería/inspector. La librería base no se modifica.
+rendiciones y componentes de galería/inspector. La política de notas, búsqueda y
+renderización pertenece a la aplicación; Revenant gestiona sus recursos nativos.
 
-`native/src/catalog.rs` contiene esas capacidades. `web/src/lib/types.ts` infiere
-sus DTOs desde la fachada compilada. `image-queue.ts` limita admisión y memoria de
-URLs. Las operaciones usan workers bloqueantes para escaneo y decodificación.
+## Cómo leer el ejemplo
+
+1. Empieza por [`web/src/routes/+layout.svelte`](web/src/routes/+layout.svelte):
+   `setupApp()` crea la aplicación tipada, proporciona el contexto y gestiona su
+   limpieza. [`+page.svelte`](web/src/routes/+page.svelte) obtiene un scope con
+   `useApp()` y conecta los modelos con la biblioteca, galería e inspector.
+2. Lee [`native/src/lib.rs`](native/src/lib.rs) y
+   [`operations.rs`](native/src/operations.rs): muestran cómo registrar las seis
+   capacidades, usar `TaskContext` y ejecutar trabajo bloqueante fuera del runtime.
+   [`contracts.rs`](native/src/contracts.rs) documenta sus entradas y resultados.
+3. En [`web/src/lib/types.ts`](web/src/lib/types.ts), `OperationOutput` infiere los
+   DTOs desde Rust. Los modelos de `web/src/lib/models/` muestran tres usos:
+   `operation.query()` para lecturas reemplazables, `annotate.call()` para guardar
+   notas en orden y `scan.run()` para observar progreso y pedir cancelación.
+4. Profundiza según el tema: [`catalog.rs`](native/src/catalog.rs) contiene
+   almacenamiento y búsqueda; [`scanning.rs`](native/src/scanning.rs), escaneo y
+   reconciliación; [`rendition.rs`](native/src/rendition.rs), decodificación y caché.
+   `image-queue.ts` limita admisión y URLs retenidas en el frontend. El inspector
+   controla el ciclo de vida de su vista previa.
+
+Las pruebas nativas están en `native/src/tests.rs`; las del frontend, en
+`web/tests/`. La fachada y el SDK bajo `.revenant/` son salidas del framework:
+consulta los archivos anteriores para aprender a escribir la aplicación.
+
+La eliminación usa `confirm` de `@revenant/client` y espera la respuesta nativa
+antes de guardar o modificar el catálogo. El coordinador también impide acciones
+si la confirmación falla o el componente se destruye mientras espera.
 
 ## Validación
 

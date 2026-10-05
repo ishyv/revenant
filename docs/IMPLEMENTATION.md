@@ -18,7 +18,9 @@ handlers. `Application::capability` adds providers with configuration;
 constructing/exporting an application does not start windows or acquire resources.
 
 Generated bindings expose grouped `app.operations`, typed input/output contracts,
-`createApp`, `provideApp`, `useApp`, and scoped lifecycle. Rustdoc and operation
+`setupApp`, `createApp`, `provideApp`, `useApp`, and scoped lifecycle. Operation
+queries provide explicit latest-result read stores; input/output type helpers
+infer DTOs without handwritten duplicate contracts. Rustdoc and operation
 source metadata are carried into generated documentation. Core, SDK, macros and
 desktop enforce public documentation. Strict Rustdoc and actual generated
 TypeScript hover/source-link checks pass; CI requires the same standard.

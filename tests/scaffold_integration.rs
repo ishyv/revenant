@@ -59,6 +59,15 @@ fn builtin_scaffold_needs_only_svelte_and_version_three_config() {
     let tauri: Value =
         serde_json::from_str(&read(&root, ".revenant/desktop/tauri.conf.json")).unwrap();
     assert_eq!(tauri["build"]["frontendDist"], "../../build/web");
+    // Permit async confirmation for the local main window without file-dialog access.
+    assert_eq!(
+        tauri["app"]["security"]["capabilities"][0],
+        serde_json::json!({
+            "identifier": "desktop-confirmation",
+            "windows": ["main"],
+            "permissions": ["dialog:allow-message"]
+        })
+    );
     assert_eq!(
         tauri["bundle"]["windows"]["webviewInstallMode"]["type"],
         "offlineInstaller"
@@ -98,6 +107,10 @@ fn sdk_snapshot_resolves_without_the_cli_checkout() {
     let client: Value = serde_json::from_str(&read(&sdk, "packages/client/package.json")).unwrap();
     assert_eq!(client["version"], "0.3.0");
     let host: toml::Value = toml::from_str(&read(&root, ".revenant/desktop/Cargo.toml")).unwrap();
+    assert_eq!(
+        host["dependencies"]["tauri-plugin-dialog"].as_str(),
+        Some("2")
+    );
     for name in ["revenant", "revenant-desktop"] {
         let relative = host["dependencies"][name]["path"].as_str().unwrap();
         assert!(

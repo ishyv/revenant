@@ -1,14 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { stripTypeScriptTypes } from "node:module";
-const source = readFileSync(
-  new URL("../src/lib/image-queue.ts", import.meta.url),
-  "utf8",
-);
-const { imageQueue } = await import(
-  `data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source, { mode: "transform" })).toString("base64")}`
-);
+import { createImageRenderer, imageQueue } from "../src/lib/image-queue.ts";
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 test("image queue bounds admission, prioritizes previews and drops unmounted tiles", async () => {
@@ -61,4 +53,37 @@ test("failed images may be retried and old cached URLs are evicted", async () =>
   await render("b", false);
   await render("broken", false);
   assert.equal(calls.filter((id) => id === "broken").length, 3);
+});
+
+test("native rendering admits two calls and retains at most eighty cached URLs", async () => {
+  const calls = [];
+  const pending = new Map();
+  let hold = true;
+  const render = createImageRenderer({
+    call(input) {
+      calls.push(input);
+      if (!hold) return Promise.resolve({ dataUrl: input.id });
+      return new Promise((resolve) => pending.set(input.id, resolve));
+    },
+  });
+  const first = render("first", false);
+  const second = render("second", true);
+  const third = render("third", false);
+  assert.deepEqual(calls, [
+    { id: "first", large: false },
+    { id: "second", large: true },
+  ]);
+  pending.get("first")({ dataUrl: "first-url" });
+  assert.equal(await first, "first-url");
+  await tick();
+  assert.equal(calls.length, 3);
+  pending.get("second")({ dataUrl: "second-url" });
+  pending.get("third")({ dataUrl: "third-url" });
+  await Promise.all([second, third]);
+  assert.equal(await render("first", false), "first-url");
+  assert.equal(calls.length, 3);
+  hold = false;
+  for (let index = 0; index < 80; index++) await render(`image-${index}`, false);
+  assert.equal(await render("first", false), "first");
+  assert.equal(calls.filter((input) => input.id === "first").length, 2);
 });

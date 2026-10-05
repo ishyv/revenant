@@ -1,7 +1,44 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createApp } from '../src/app.ts';
+import { confirm } from '../src/transport.ts';
+import * as svelteContext from '../src/svelte.ts';
+import { compile } from 'svelte/compiler';
+import { render } from 'svelte/server';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { NativeHost, hasCode, manifest, nativeError, turn, until, within } from './fixtures/native-host.mjs';
+
+test('native confirmation accepts only Yes and waits for the dialog response', async t => {
+  const original = globalThis.window;
+  t.after(() => { globalThis.window = original; });
+  let resolve;
+  globalThis.window = { __TAURI_INTERNALS__: { invoke(command, options) {
+    assert.equal(command, 'plugin:dialog|message');
+    assert.deepEqual(options, { message: 'Remove folder?', buttons: 'YesNo' });
+    return new Promise(done => { resolve = done; });
+  } } };
+  const result = confirm('Remove folder?');
+  let settled = false;
+  void result.then(() => { settled = true; });
+  await turn();
+  assert.equal(settled, false);
+  resolve('Yes');
+  assert.equal(await result, true);
+  for (const response of ['No', 'Cancel', 'Ok', true]) {
+    const cancelled = confirm('Remove folder?');
+    resolve(response);
+    assert.equal(await cancelled, false);
+  }
+});
+
+test('native confirmation reports dialog failures instead of approving', async t => {
+  const original = globalThis.window;
+  t.after(() => { globalThis.window = original; });
+  globalThis.window = { __TAURI_INTERNALS__: { invoke: async () => { throw new Error('dialog unavailable'); } } };
+  await assert.rejects(confirm('Remove folder?'), /dialog unavailable/);
+});
 
 function application(t, host = new NativeHost(), options = {}) {
   const app = createApp({ transport: host, manifest, ...options });
@@ -31,6 +68,162 @@ async function selected(t) {
   await selection.set([setup.files.items[0]]);
   return { ...setup, selection };
 }
+
+function echoQuery(app) {
+  return app.bindOperation(manifest.operations[0]).query();
+}
+
+async function admitted(host, value) {
+  await until(() => [...host.tasks.values()].some(task => task.inputs[0]?.value === value), `query ${value} admitted`);
+  return [...host.tasks.values()].find(task => task.inputs[0]?.value === value).snapshot.id;
+}
+
+test('operation queries discard late results and reclaim superseded native tasks', async t => {
+  const { app, host } = application(t);
+  const query = echoQuery(app);
+  const gate = host.blockNext('task.run', 'reply');
+  const old = query.load({ value: 'old' });
+  const stale = await gate.entered.promise;
+  const latest = query.load({ value: 'latest' });
+  host.complete(await admitted(host, 'latest'), { result: 'latest result' });
+  await latest;
+  stale.updates({ ...stale.reply, state: 'succeeded', result: 'old result' });
+  gate.release.resolve();
+  await old;
+  assert.deepEqual(query.snapshot, { status: 'ready', data: 'latest result' });
+  assert.equal(host.tasks.size, 0);
+});
+
+test('operation queries retain data while refreshing and capture recoverable failures', async t => {
+  const { app, host } = application(t);
+  const query = echoQuery(app);
+  const initial = query.load({ value: 'initial' });
+  host.complete(await admitted(host, 'initial'), { result: 'previous' });
+  await initial;
+  const refresh = query.load({ value: 'refresh' });
+  assert.deepEqual(query.snapshot, { status: 'loading', data: 'previous' });
+  const id = await admitted(host, 'refresh');
+  host.tasks.get(id).snapshot.error = { code: 'read_failed', message: 'Read failed', retryable: true };
+  host.complete(id, { state: 'failed' });
+  await refresh;
+  assert.equal(query.snapshot.status, 'failed');
+  assert.equal(query.snapshot.data, 'previous');
+  assert.equal(query.snapshot.error.code, 'read_failed');
+  const retry = query.load({ value: 'retry' });
+  host.complete(await admitted(host, 'retry'), { result: 'recovered' });
+  await retry;
+  assert.deepEqual(query.snapshot, { status: 'ready', data: 'recovered' });
+});
+
+test('query invalidation suppresses old responses before a debounced request begins', async t => {
+  const { app, host } = application(t);
+  const query = echoQuery(app);
+  const gate = host.blockNext('task.run', 'reply');
+  const pending = query.load({ value: 'old search' });
+  const old = await gate.entered.promise;
+  query.invalidate();
+  old.updates({ ...old.reply, state: 'succeeded', result: 'stale search' });
+  assert.equal(query.snapshot.status, 'idle');
+  assert.equal(query.snapshot.data, undefined);
+  gate.release.resolve();
+  await pending;
+  assert.equal(host.tasks.size, 0);
+});
+
+test('scope disposal freezes query state while pending native admission is reclaimed', async t => {
+  const { app, host } = application(t);
+  const query = echoQuery(app);
+  const publications = [];
+  query.subscribe(value => publications.push(value));
+  const gate = host.blockNext('task.run', 'reply');
+  const pending = query.load({ value: 'pending' });
+  const old = await gate.entered.promise;
+  app.dispose();
+  const count = publications.length;
+  old.updates({ ...old.reply, state: 'succeeded', result: 'after unmount' });
+  gate.release.resolve();
+  await pending;
+  await app.disposeAsync();
+  assert.equal(publications.length, count);
+  assert.equal(query.snapshot.data, undefined);
+  assert.equal(host.tasks.size, 0);
+  await query.dispose();
+});
+
+test('queries record invalid input without submitting a native task', async t => {
+  const { app, host } = application(t);
+  const query = echoQuery(app);
+  await query.load({ value: 12 });
+  assert.equal(query.snapshot.status, 'failed');
+  assert.ok(query.snapshot.error.code);
+  assert.equal(host.requests('task.run').length, 0);
+});
+
+test('query subscriptions can replace a load synchronously without admitting obsolete work', async t => {
+  const { app, host } = application(t);
+  const query = echoQuery(app);
+  let replacement;
+  const stop = query.subscribe(snapshot => {
+    if (snapshot.status === 'loading' && !replacement) {
+      replacement = Promise.resolve();
+      replacement = query.load({ value: 'replacement' });
+    }
+  });
+  t.after(stop);
+  await query.load({ value: 'obsolete' });
+  host.complete(await admitted(host, 'replacement'), { result: 'replacement' });
+  await replacement;
+  assert.equal(query.snapshot.data, 'replacement');
+  assert.equal(host.requests('task.run').length, 1);
+});
+
+test('query cleanup failures remain observable on the owning scope', async t => {
+  const host = new NativeHost();
+  const app = createApp({ transport: host, manifest });
+  t.after(() => app.disposeAsync());
+  const dispatch = host.dispatch.bind(host);
+  host.dispatch = async (request, updates) => {
+    const result = await dispatch(request, updates);
+    if (request.action === 'task.dispose') throw nativeError('cleanup_failed', 'Task cleanup failed');
+    return result;
+  };
+  const query = echoQuery(app);
+  const pending = query.load({ value: 'cleanup' });
+  host.complete(await admitted(host, 'cleanup'), { result: 'value' });
+  await pending;
+  assert.equal(query.snapshot.data, 'value');
+  assert.equal(app.cleanupErrors.current.length, 1);
+  assert.equal(app.cleanupErrors.current[0].code, 'cleanup_failed');
+});
+
+test('Svelte setup provides the existing root and disposes root and child on component teardown', async t => {
+  assert.equal(typeof svelteContext.setupApp, 'function');
+  const { app, host } = application(t);
+  const directory = mkdtempSync(join(dirname(fileURLToPath(import.meta.url)), '.setup-'));
+  try {
+    const component = compile(`<script>
+      import { setupApp, useApp } from '../../src/svelte.ts';
+      let { app, observe } = $props();
+      const root = setupApp(app);
+      const child = useApp();
+      observe(root, child);
+    </script>`, { generate: 'server', filename: 'Setup.svelte' });
+    const entry = join(directory, 'Setup.mjs');
+    writeFileSync(entry, component.js.code);
+    let scoped;
+    await render((await import(pathToFileURL(entry).href)).default, { props: {
+      app,
+      observe(root, child) { assert.equal(root, app); scoped = child; },
+    } });
+    assert.equal(scoped.scope.parent, app.scope);
+    await app.disposeAsync();
+    assert.equal(app.scope.disposed, true);
+    assert.equal(scoped.scope.disposed, true);
+    assert.equal(host.scopes.size, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('picker cancellation, native bookmark restoration and preview ownership', async t => {
   const { app, host } = application(t);

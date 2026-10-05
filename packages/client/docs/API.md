@@ -19,6 +19,7 @@ declaration has JSDoc, including constructors and DTO fields.
 | `App.createScope()` | Return a child app immediately. Native work waits for child-scope admission. |
 | `App.dispose()`, `disposeAsync()` | Begin teardown synchronously, or await resource and native scope cleanup. |
 | `App.cleanupErrors` | Observe classified resource and native teardown failures. |
+| `confirm(message)` | Await a native Yes/No dialog. Only Yes returns `true`; cancellation returns `false`, and a dialog failure rejects. Generated hosts permit message dialogs for their main window. |
 | `Scope.ready`, `id`, `parent`, `transport`, `disposed` | Advanced native ownership state; read `id` after readiness. |
 | `Scope.assert()`, `own(resource)`, `release(resource)` | Check local lifetime, register idempotent cleanup, or forget a released resource. |
 | `Scope.child()`, `request(request, updates?)` | Create an owned native child or dispatch a scoped capability after startup. Updates are direct snapshots. |
@@ -72,6 +73,12 @@ does not mistake its current item count for the complete dataset. See
 | `Operation.id`, `definition`, `owner` | Stable registration ID, compiled definition after lazy connection and task admission owner. |
 | `Operation.run(input)` | Return a task immediately; native readiness and compiled input/output validation are automatic. |
 | `Operation.call(input)` | Await one successful result and dispose its task in `finally`. |
+| `Operation.query()` | Own an explicitly loaded, replaceable read projection; no requests run until `load`. |
+| `OperationInput<T>`, `OperationOutput<T>` | Infer a generated operation's compiled input and output types. |
+| `Query.subscribe`, `snapshot` | Observe `{status: idle/loading/ready/failed, data?, error?}`; previous data survives reloads and failures. |
+| `Query.load(input)` | Resolve after this load settles and its task is reclaimed. Current failures become state; stale successes and failures cannot publish. Loading a closed query rejects. |
+| `Query.invalidate()` | Synchronously suppress pending results and clear current error before submitting a debounced replacement. Retain the previous data. |
+| `Query.dispose()` | Freeze publication and await all pending task cleanup. Scope teardown does this automatically; cleanup failures remain in scope `cleanupErrors`. |
 | `Operation.runBatch(inputs)` | Native JSON-record lane, bounded to 512 inputs and one MiB of encoded input values. |
 | `Operation.runSelection(selector)` | Advanced native batch submission through a captured ID, generation-aware all-matching selector or bounded JSON inputs. |
 | `Operation.forScope(scope)` | Rebind the same compiled registration within the same native transport. |
@@ -142,9 +149,13 @@ the precise documented protocol shapes for host integration.
 
 ## Svelte context and optional UI
 
-The `/svelte` entry exports `createApp`, `provideApp` and `useApp`; call these
+The `/svelte` entry exports `createApp`, `setupApp`, `provideApp` and `useApp`; call these
 during component initialization. `createApp` provides a root and closes it on
 unmount. `provideApp(existing)` installs context without taking root ownership.
+`setupApp(existing)` provides a root and owns its teardown. The generated facade
+instead exposes `setupApp(options?)`, which creates its typed root before
+providing it. Use that generated helper in application layouts; core `createApp`
+remains available outside Svelte initialization without installing context.
 `useApp(parent?)` owns a child of an explicit parent or the nearest context and
 provides that child to descendants. Nested components therefore follow native
 scope ancestry. Component disposal begins asynchronously; use the core app's

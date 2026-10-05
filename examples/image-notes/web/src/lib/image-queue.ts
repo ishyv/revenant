@@ -1,6 +1,20 @@
-import type { ImageRenderer } from "./types";
+import type { ImageOperations, ImageRenderer } from "./types";
 
-/** Bound decode admission and retained frontend data URLs independently of catalog size. */
+/** Admit one-shot native reads through the queue; Operation.call owns task cleanup. */
+export function createImageRenderer(
+  operation: Pick<ImageOperations["render"], "call">,
+): ImageRenderer {
+  return imageQueue(async (id, large) => {
+    const rendition = await operation.call({ id, large });
+    return rendition.dataUrl;
+  });
+}
+
+/**
+ * Bound decode admission and retained data URLs independently of catalog size.
+ * Abort removes waiting work only; an admitted decode finishes and its consumer
+ * must suppress late publication. Eviction drops cache ownership, not active work.
+ */
 export function imageQueue(
   render: ImageRenderer,
   concurrency = 2,
@@ -10,7 +24,9 @@ export function imageQueue(
   const waiting: Array<{ start: () => void; cancel: () => void }> = [];
   const cache = new Map<string, Promise<string>>();
   const evict = () => {
-    while (cache.size > maxCached) cache.delete(cache.keys().next().value!);
+    while (cache.size > maxCached) {
+      cache.delete(cache.keys().next().value!);
+    }
   };
   return (id, large, signal) => {
     if (signal?.aborted)
@@ -44,8 +60,11 @@ export function imageQueue(
       if (active < concurrency) start();
       else {
         const work = { start, cancel };
-        if (large) waiting.unshift(work);
-        else waiting.push(work);
+        if (large) {
+          waiting.unshift(work);
+        } else {
+          waiting.push(work);
+        }
         signal?.addEventListener("abort", cancel, { once: true });
       }
     });

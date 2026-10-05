@@ -119,7 +119,16 @@ pub fn prepare_host(root: &Path, config: &RevenantConfig) -> Result<PathBuf> {
             "withGlobalTauri": true,
             "windows": [{"label": "main", "title": config.desktop.title.as_ref().unwrap_or(&config.project.name),
                 "width": config.desktop.width, "height": config.desktop.height}],
-            "security": {"csp": null}
+            "security": {
+                "csp": null,
+                // Revenant's async confirmation uses the current message command.
+                // Folder selection still runs through Revenant's scoped file API.
+                "capabilities": [{
+                    "identifier": "desktop-confirmation",
+                    "windows": ["main"],
+                    "permissions": ["dialog:allow-message"]
+                }]
+            }
         },
         "bundle": {"active": true, "targets": if cfg!(windows) { serde_json::json!(["nsis"]) } else { serde_json::json!("all") },
             "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
