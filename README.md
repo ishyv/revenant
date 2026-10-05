@@ -1,59 +1,122 @@
 # Revenant
 
-Revenant 0.3 builds native desktop applications with ordinary Svelte and typed
-Rust capabilities. Tauri hosts the window; Rust owns filesystem access, jobs,
-leases, previews, settings, and provider lifecycle. Svelte observes bounded
-projections. HyvUI is the default, replaceable presentation layer.
+A CLI that scaffolds and drives native Rust + SvelteKit applications. Write
+logic in Rust and consume it from Svelte 5 — one tool manages the entire build
+loop, including a generated TypeScript facade for native operations.
 
-A minimal application needs Svelte and configuration. Built-in files, metadata,
-checksums, and settings require no handwritten Rust. Custom operations belong
-in an optional `native/` library; Revenant generates their TypeScript facade
-from the compiled application contract.
+<div align="center">
+  <img src="./imgs/image.png" alt="Revenant" width="200"/>
+  <img src="./imgs/image2.png" alt="Revenant" width="200"/>
+</div>
 
-## Start
+## Why
 
-Install Rust/Cargo and Node/npm plus the native desktop prerequisites.
-On Windows, this includes MSVC C++ build tools and WebView2.
-`revenant setup` reports tool availability and prerequisite guidance.
+Setting up Rust with SvelteKit for desktop means wiring together Tauri,
+Vite, native bindings, and a file watcher — then keeping them in sync.
+Revenant manages the build loop, generates bindings from the compiled Rust
+contract, and packages the frontend with the native executable.
+
+Filesystem access, media previews, checksums, and settings are built-in
+capabilities. Custom operations live in an optional Rust library. The frontend
+uses the same typed API for both.
+
+## Requirements
+
+- **Rust** with `cargo`
+- **Node.js** with `npm`
+- **Native desktop prerequisites** — MSVC C++ Build Tools and WebView2 on Windows
+
+Run `revenant setup` to check tool availability and platform prerequisites.
+
+## Quick Start
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 revenant setup
 revenant new my-app
 cd my-app
 revenant dev
 ```
 
-`new` materializes the local SDK, installs frontend dependencies, compiles the
-hidden native host, and generates the facade. `dev` runs Vite and the native
-window, rebuilding native source/configuration changes. `build` compiles the
-native application, generates its contract, builds the static frontend, and
-bundles the desktop application. Windows installers are produced beneath
-`.revenant/target/release/bundle/nsis/`. Installed Windows and 500,000-file
-validation results are recorded below. Pass `--verbose` for child-process logs.
+`revenant dev` opens the application in a Tauri window with Vite serving the
+frontend. Svelte changes reload the interface; Rust changes rebuild the native
+host and regenerate bindings.
 
-## Author-owned files
+## Commands
+
+### `revenant new <name>`
+
+Scaffolds a SvelteKit application, materializes a local SDK snapshot, and
+generates the Tauri host. Installs frontend dependencies, compiles the native
+application, and generates its TypeScript facade.
+
+### `revenant dev`
+
+Runs an initial native build, starts Vite and the desktop window, and watches
+native source, configuration, and local SDK dependencies. Failed rebuilds
+preserve the running application and its previous bindings. Ctrl+C stops the
+owned processes.
+
+### `revenant build`
+
+Compiles the native application, exports its contract, builds the static
+frontend, and packages the desktop application. The final executable's contract
+is checked against the generated facade before bundling. Windows installers
+are produced under `.revenant/target/release/bundle/nsis/`.
+
+### `revenant setup`
+
+Checks the required tools and reports platform-specific installation guidance.
+
+### `--verbose`
+
+All commands accept `--verbose` to show full child-process output.
+
+## Project Structure
 
 ```text
 my-app/
-  revenant.toml             # version = 3, [project] name = "my-app"
-  web/src/routes/           # Ordinary Svelte application
-  native/                  # Optional Rust library exporting app() -> Application
-  .revenant/sdk/           # Local SDK snapshot; retain with the application
-  .revenant/desktop/       # Generated bootstrap, Cargo/Tauri configuration
-  web/src/lib/revenant.ts  # Generated compiled-contract facade
+  revenant.toml             # Project configuration, version = 3
+  web/src/routes/           # SvelteKit routes and components
+  native/                  # Optional Rust application library
+  web/src/lib/revenant.ts  # Generated TypeScript facade
+  .revenant/sdk/           # Local SDK source snapshot
+  .revenant/desktop/       # Generated Tauri host
 ```
 
-Use `setupApp()` in the layout and `useApp()` in descendants from `$lib/revenant`.
-The explicit `createApp` and `provideApp` helpers remain available. Native folders
-provide indexed query windows; large selections and batch results stay native
-and are paged into the UI. Child components own child scopes. Cancellation
-requests remain distinct from executor completion.
+The generated facade exports `setupApp()` for the layout and `useApp()` for
+descendant components. A custom `native/` library exports
+`app() -> Application`; operation macros define the contracts used to generate
+the frontend API. Applications using only built-in capabilities need no
+handwritten Rust.
 
-Version 2 and unversioned WASM/HTTP projects are rejected with migration
-instructions. Changing the version alone is not a migration. See
-[authoring and migration](docs/AUTHORING.md), [architecture](docs/ARCHITECTURE.md),
-[approved design](docs/DESIGN.md), and [implementation](docs/IMPLEMENTATION.md).
-[Validation](docs/VALIDATION.md) records measured native/UI bounds, installed
-offline workflows, language-service navigation, and remaining release limitations.
-Earlier web/HTTP results remain labeled historical evidence.
+Examples: [file/media](examples/file-media/README.md),
+[prime sieve](examples/prime-sieve/README.md), and
+[Luma image notes](examples/image-notes/README.md).
+
+## Architecture
+
+Revenant 0.3 uses Tauri for the desktop window and IPC. Rust owns filesystem
+access, jobs, resource lifetimes, and persistence. Folder indexes, large
+selections, and batch results stay in native SQLite storage; the client reads
+bounded query and result pages. HyvUI is the default, replaceable UI layer.
+
+Resources belong to component scopes. Active operations retain leases until
+execution finishes; requesting cancellation does not imply completion.
+Generated bindings carry the compiled contract's types, Rust documentation,
+and source metadata.
+
+The CLI embeds an SDK snapshot so generated apps can build independently of
+this checkout. Keep `.revenant/sdk/` with the application; host preparation
+preserves local SDK edits.
+
+Version 2 and unversioned WASM/HTTP configurations are rejected with migration
+instructions. Migration requires changes to the host, native library, and
+frontend API, not just the configuration version.
+
+- [Authoring and migration](docs/AUTHORING.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Design](docs/DESIGN.md) and [implementation](docs/IMPLEMENTATION.md)
+- [Validation and release limits](docs/VALIDATION.md): measured native/UI
+  bounds, installed Windows workflows, and editor navigation. Earlier web/HTTP
+  results are kept as historical evidence.
