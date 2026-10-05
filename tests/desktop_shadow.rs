@@ -58,11 +58,41 @@ fn open(endpoint: SocketAddr) -> bool {
     TcpStream::connect_timeout(&endpoint, Duration::from_millis(100)).is_ok()
 }
 
-#[test]
-fn loaded_shadow_allows_recompile_and_reaps_descendants_before_directory_cleanup() {
+fn shadow_project() -> (TempDir, PathBuf) {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("shadow-proof");
     scaffold::create_project(&root, "shadow-proof").unwrap();
+    (temp, root)
+}
+
+#[test]
+fn loaded_shadow_allows_recompile_and_reaps_descendants_before_directory_cleanup() {
+    let (_temp, root) = shadow_project();
+    exercise_shadow_lifecycle(root);
+}
+
+#[test]
+fn loaded_shadow_supports_alternate_case_project_path() {
+    let (_temp, root) = shadow_project();
+    // Create the directory before aliasing it so its stored spelling stays distinct.
+    let alias = root.with_file_name("SHADOW-PROOF");
+    assert_ne!(alias, root);
+    assert_eq!(
+        dunce::canonicalize(&alias).unwrap(),
+        dunce::canonicalize(&root).unwrap()
+    );
+    exercise_shadow_lifecycle(alias);
+}
+
+#[test]
+fn loaded_shadow_supports_verbatim_project_path() {
+    let (_temp, root) = shadow_project();
+    let alias = fs::canonicalize(&root).unwrap();
+    assert_ne!(alias, dunce::canonicalize(&root).unwrap());
+    exercise_shadow_lifecycle(alias);
+}
+
+fn exercise_shadow_lifecycle(root: PathBuf) {
     let build = DesktopBuild::new(&root, &RevenantConfig::load(&root).unwrap(), false).unwrap();
     compile(&build.executable, "first");
     let (logs, _receiver) = mpsc::channel();
@@ -93,7 +123,16 @@ fn loaded_shadow_allows_recompile_and_reaps_descendants_before_directory_cleanup
     let (first_image, first_endpoint) = ready(&root);
     assert_ne!(first_image, build.executable);
     assert_eq!(first_image.file_name(), build.executable.file_name());
-    assert!(first_image.starts_with(root.join(".revenant/run")));
+    let expected_runs = root.join(".revenant/run");
+    // Windows aliases can identify the same directory without matching lexically.
+    // Resolve both sides, just as the launcher resolves the project root.
+    let resolved_image = dunce::canonicalize(&first_image).unwrap();
+    let resolved_runs = dunce::canonicalize(&expected_runs).unwrap();
+    assert!(
+        resolved_image.starts_with(&resolved_runs),
+        "shadow image {first_image:?} (resolved {resolved_image:?}) is outside \
+         run directory {expected_runs:?} (resolved {resolved_runs:?})"
+    );
     let first_bytes = fs::read(&first_image).unwrap();
     // A real compiler relinks the same output while the original shadow is loaded.
     compile(&build.executable, "second");
