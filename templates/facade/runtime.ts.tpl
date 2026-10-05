@@ -42,6 +42,11 @@ export function createApp(options: Omit<Parameters<typeof createRuntime>[0], 'ma
   return bindApp(createRuntime<{{checksum_type}}, {{metadata_type}}>({ ...options, manifest: contract }));
 }
 
+/** Create a typed root, provide it to descendants, and close it when the Svelte owner unmounts. */
+export function setupApp(options: Omit<Parameters<typeof createRuntime>[0], 'manifest'> = {}): Application {
+  return bindApp(setupRuntimeApp(createApp(options)));
+}
+
 /** Provide this typed application to descendants during component initialization. */
 export function provideApp(app: Application): Application {
   provideRuntimeApp(app);

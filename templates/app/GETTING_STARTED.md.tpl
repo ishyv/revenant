@@ -77,7 +77,8 @@ progress. Return the application from `app()` without writing a `main`, Tokio
 bootstrap, target cfgs, or registry/export glue. Restart `revenant dev` after
 adding `native/`; later source edits rebuild automatically.
 
-The layout creates and provides the generated app. Components import `useApp`
+The layout calls generated `setupApp()` to create, provide, and clean up the root.
+Components import `useApp`
 from `$lib/revenant` and use typed `app.operations.records.normalize.run(input)`.
 Await `app.ready` before capability calls. Give resources and tasks a component
 scope and dispose it on teardown. Built-ins, including `files.checksum`, are

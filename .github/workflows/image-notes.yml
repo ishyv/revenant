@@ -1,0 +1,53 @@
+name: Luma Windows app
+
+on:
+  push:
+    branches: [feat/image-notes-demo]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            examples/image-notes/.revenant/desktop -> examples/image-notes/.revenant/target
+            examples/image-notes/native -> examples/image-notes/native/target
+      - name: Build Revenant CLI
+        run: |
+          cargo build -p revenant --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build Luma desktop installer
+        run: |
+          $cli = (Resolve-Path target/debug/revenant.exe).Path
+          Push-Location examples/image-notes
+          try {
+            & $cli build --verbose
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            npm run check --prefix web
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            npm test --prefix web
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            cargo test --manifest-path native/Cargo.toml --locked
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luma-windows-installer
+          path: examples/image-notes/.revenant/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

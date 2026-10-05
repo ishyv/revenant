@@ -9,7 +9,12 @@ const application = Symbol("revenant.application");
 export function createApp<Checksum = unknown, Metadata = unknown>(
   options: AppOptions = {},
 ): App<Checksum, Metadata> {
-  const app = createRoot<Checksum, Metadata>(options);
+  return setupApp(createRoot<Checksum, Metadata>(options));
+}
+/** Provide an existing root during initialization and own its cleanup on component teardown. */
+export function setupApp<Checksum, Metadata>(
+  app: App<Checksum, Metadata>,
+): App<Checksum, Metadata> {
   setContext(application, app);
   onDestroy(() => app.dispose());
   return app;

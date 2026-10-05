@@ -16,12 +16,10 @@ The scaffold includes a root layout:
 
 ```svelte
 <script lang="ts">
-  import { onDestroy } from 'svelte';
-  import { createApp, provideApp } from '$lib/revenant';
+  import { setupApp } from '$lib/revenant';
   import type { Snippet } from 'svelte';
   let { children }: { children: Snippet } = $props();
-  const app = provideApp(createApp());
-  onDestroy(() => app.dispose());
+  setupApp();
 </script>
 {@render children()}
 ```
@@ -79,6 +77,17 @@ promise. Batch results expose `page(offset, limit)` and `pages(limit)`: maximum
 512 outcomes, default 128. Retain the task while consuming results; disposal
 releases native history/results. Partial/failed item outcomes stay inspectable
 while their owner lives. Supported media previews are also owned resources.
+
+For replaceable reads, use `operation.query()`. Its store exposes
+`{status, data?, error?}`; `load(input)` retains the previous data while loading
+and publishes only the newest result. `invalidate()` immediately suppresses an
+old response before a debounced replacement begins. The owning component scope
+cleans up pending tasks. Failed reads become query state, so inspect `error`
+after awaiting `load`; use explicit `call` for mutations such as saving notes.
+
+Infer DTOs with `OperationInput<typeof operation>` and
+`OperationOutput<typeof operation>` from `@revenant/client`. These helpers
+preserve the Rust-generated types without handwritten duplicate interfaces.
 
 ## Optional custom Rust
 

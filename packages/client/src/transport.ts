@@ -2,6 +2,19 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { CapabilityError, errorOf } from "./contracts.js";
 
+/** Show a native Yes/No dialog; only an explicit Yes approves the action.
+ * Await the answer before mutating state. A failed dialog rejects the promise.
+ */
+export async function confirm(message: string): Promise<boolean> {
+  // Use the current message command: some plugin versions still install a
+  // window.confirm wrapper that invokes the removed legacy confirm command.
+  const answer = await invoke<string>("plugin:dialog|message", {
+    message,
+    buttons: "YesNo",
+  });
+  return answer === "Yes";
+}
+
 /** A dispatcher request. Capability fields are documented in docs/WIRE.md. */
 export interface NativeRequest {
   /** Native dispatcher action selecting the requested capability operation. */

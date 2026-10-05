@@ -44,7 +44,8 @@ my-app/
   web/src/lib/revenant.ts  # Generated compiled-contract facade
 ```
 
-Use `createApp`, `provideApp`, and `useApp` from `$lib/revenant`. Native folders
+Use `setupApp()` in the layout and `useApp()` in descendants from `$lib/revenant`.
+The explicit `createApp` and `provideApp` helpers remain available. Native folders
 provide indexed query windows; large selections and batch results stay native
 and are paged into the UI. Child components own child scopes. Cancellation
 requests remain distinct from executor completion.
