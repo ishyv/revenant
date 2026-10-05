@@ -29,7 +29,7 @@
   let dataPath = $state('');
   let scanTask = $state<ReturnType<typeof operations.scan.run>>();
   const scanProjection = $derived(scanTask ? fromStore(scanTask) : undefined);
-  const scanning = $derived(!!scanTask && !scanTask.terminal);
+  const scanning = $derived(!!scanProjection && ['queued', 'running', 'cancelling'].includes(scanProjection.current.state));
   const currentRoot = $derived(roots.find((root) => root.id === rootId));
   const dirty = $derived(!!selected && draft !== selected.note);
   const allCount = $derived(roots.reduce((sum, root) => sum + root.count, 0));
