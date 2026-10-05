@@ -1,105 +1,58 @@
 # Revenant
 
-A CLI that scaffolds and drives Rust/WebAssembly + SvelteKit projects. Write
-logic in Rust, compile to WASM, and consume it from Svelte 5 — one tool
-manages the entire build loop, including a generated TypeScript facade that
-hides the raw `wasm-bindgen` package.
+Revenant 0.3 builds native desktop applications with ordinary Svelte and typed
+Rust capabilities. Tauri hosts the window; Rust owns filesystem access, jobs,
+leases, previews, settings, and provider lifecycle. Svelte observes bounded
+projections. HyvUI is the default, replaceable presentation layer.
 
-<div align="center">
-  <img src="./imgs/image.png" alt="Revenant" width="200"/>
-  <img src="./imgs/image2.png" alt="Revenant" width="200"/>
-</div>
+A minimal application needs Svelte and configuration. Built-in files, metadata,
+checksums, and settings require no handwritten Rust. Custom operations belong
+in an optional `native/` library; Revenant generates their TypeScript facade
+from the compiled application contract.
 
-## Why
+## Start
 
-Setting up Rust/WASM with SvelteKit by hand means wiring together `wasm-pack`,
-Vite plugins, path aliases, and a file watcher — then hoping they stay in sync.
-`wasm-pack` has no `--watch` flag
-([wasm-pack#457](https://github.com/rustwasm/wasm-pack/issues/457)), so you
-either poll manually or write your own watcher. Revenant does this once,
-correctly, so you can focus on code.
-
-## Requirements
-
-- **Rust** (with `cargo`) — [rustup.rs](https://rustup.rs)
-- **Node.js 18+** (with `npm`) — [nodejs.org](https://nodejs.org)
-- **wasm-pack** — auto-installed via `cargo install wasm-pack` if missing
-
-Not sure what you have? Run `revenant setup` for a guided checklist.
-
-## Quick Start
+Install Rust/Cargo and Node/npm plus the native desktop prerequisites.
+On Windows, this includes MSVC C++ build tools and WebView2.
+`revenant setup` reports tool availability and prerequisite guidance.
 
 ```sh
 cargo install --path .
-
+revenant setup
 revenant new my-app
 cd my-app
 revenant dev
 ```
 
-Open the URL printed by the dev server. You should see `"Hello from my-app, World!"` rendered by the Svelte page calling your Rust WASM function.
+`new` materializes the local SDK, installs frontend dependencies, compiles the
+hidden native host, and generates the facade. `dev` runs Vite and the native
+window, rebuilding native source/configuration changes. `build` compiles the
+native application, generates its contract, builds the static frontend, and
+bundles the desktop application. Windows installers are produced beneath
+`.revenant/target/release/bundle/nsis/`. Installed Windows and 500,000-file
+validation results are recorded below. Pass `--verbose` for child-process logs.
 
-## Commands
+## Author-owned files
 
-### `revenant new <name>`
-
-Scaffolds a complete project: Rust WASM crate, SvelteKit app, Vite config with
-WASM plugins, and a working hello-world example. Runs `npm install`
-automatically.
-
-### `revenant dev`
-
-Runs an initial WASM build, starts a file watcher on `rust/src/`, and launches
-the SvelteKit dev server. Rust changes trigger automatic WASM rebuilds plus
-regeneration of `web/src/lib/wasm.ts` and `pkg/revenant.contract.json`.
-Ctrl+C cleanly stops all processes.
-
-### `revenant build`
-
-Production build: `wasm-pack build --release` followed by `npm run build`.
-Before the web build, Revenant regenerates the typed Svelte facade from the
-Rust exports. Fails fast if either step errors.
-
-### `revenant setup`
-
-Interactive checklist that verifies each required tool is installed and provides
-OS-specific installation instructions for anything missing.
-
-### `--verbose`
-
-All commands accept `--verbose` to show full child process output (wasm-pack,
-npm). Without it, output is kept clean and errors include relevant details.
-
-## Project Structure
-
-```
+```text
 my-app/
-├── revenant.toml         # project config (name, wasm target, package manager)
-├── GETTING_STARTED.md    # tutorial: adding functions, calling from Svelte
-├── rust/                 # wasm-pack crate
-│   ├── Cargo.toml
-│   └── src/lib.rs        # your Rust code — #[wasm_bindgen] exports
-└── web/                  # SvelteKit app
-    ├── package.json
-    ├── svelte.config.js
-    ├── vite.config.js    # wasm plugin + path alias to pkg/
-    └── src/
-        ├── app.html
-        ├── lib/wasm.ts   # generated typed facade; import this, not pkg/
-        └── routes/
-            └── +page.svelte  # imports from $lib/wasm
+  revenant.toml             # version = 3, [project] name = "my-app"
+  web/src/routes/           # Ordinary Svelte application
+  native/                  # Optional Rust library exporting app() -> Application
+  .revenant/sdk/           # Local SDK snapshot; retain with the application
+  .revenant/desktop/       # Generated bootstrap, Cargo/Tauri configuration
+  web/src/lib/revenant.ts  # Generated compiled-contract facade
 ```
 
-WASM output goes to `pkg/` at the project root, alongside
-`pkg/revenant.contract.json` — the intermediate contract manifest Revenant
-derives from `rust/src/lib.rs`. `vite-plugin-wasm` and
-`vite-plugin-top-level-await` handle browser-side loading.
+Use `createApp`, `provideApp`, and `useApp` from `$lib/revenant`. Native folders
+provide indexed query windows; large selections and batch results stay native
+and are paged into the UI. Child components own child scopes. Cancellation
+requests remain distinct from executor completion.
 
-## Roadmap
-
-**v2** — Vite plugin that triggers `wasm-pack` on import resolution, replacing
-the custom file watcher. Also: WASI target support, pnpm/yarn/bun as package
-manager options, scaffold template variants.
-
-**v3** — Post-build transform pipeline (wasm-opt, size reporting, custom
-codegen) as a trait-based extension point.
+Version 2 and unversioned WASM/HTTP projects are rejected with migration
+instructions. Changing the version alone is not a migration. See
+[authoring and migration](docs/AUTHORING.md), [architecture](docs/ARCHITECTURE.md),
+[approved design](docs/DESIGN.md), and [implementation](docs/IMPLEMENTATION.md).
+[Validation](docs/VALIDATION.md) records measured native/UI bounds, installed
+offline workflows, language-service navigation, and remaining release limitations.
+Earlier web/HTTP results remain labeled historical evidence.

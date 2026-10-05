@@ -1,6 +1,5 @@
+version = 3
+
 [project]
 name = "prime-sieve"
-
-[toolchain]
-wasm_target = "bundler"
-pkg_manager = "npm"
+identifier = "app.revenant.prime-sieve"

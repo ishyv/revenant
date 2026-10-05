@@ -1,0 +1,47 @@
+{
+  "name": "@revenant/client",
+  "version": "0.3.0",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./svelte": {
+      "types": "./src/svelte.ts",
+      "default": "./src/svelte.ts"
+    },
+    "./ui": {
+      "types": "./src/ui/index.ts",
+      "svelte": "./src/ui/index.ts",
+      "default": "./src/ui/index.ts"
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "check:ui": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "tsx --test tests/runtime.test.mjs"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "@tauri-apps/api": "2.12.1",
+    "@tanstack/svelte-virtual": "3.13.39"
+  },
+  "peerDependencies": {
+    "svelte": "^5.0.0",
+    "@hyvnt/hyvui": "1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@hyvnt/hyvui": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "typescript": "^5.7.0",
+    "tsx": "^4.23.15",
+    "@hyvnt/hyvui": "file:../../vendor/hyvui-1.0.0.tgz"
+  }
+}

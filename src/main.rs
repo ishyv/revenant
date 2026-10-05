@@ -7,7 +7,7 @@ use revenant::commands;
 #[command(
     name = "revenant",
     version,
-    about = "Rust/WASM + SvelteKit development tool"
+    about = "Native desktop applications with Rust and Svelte"
 )]
 struct Cli {
     /// Show full child process output
@@ -25,11 +25,12 @@ enum Commands {
         /// Project name
         name: String,
     },
-    /// Start the development server with WASM watch
+    /// Launch the desktop window with Vite HMR and Rust rebuilds
     Dev,
-    /// Build for production
+    /// Compile native contracts, build the SPA, and package a desktop application
     Build,
     /// Check and guide installation of required tools
+    #[command(alias = "diagnose")]
     Setup,
 }
 

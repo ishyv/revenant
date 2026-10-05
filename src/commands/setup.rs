@@ -1,132 +1,119 @@
+//! Read-only desktop prerequisites; installing dependencies is always explicit.
+use crate::toolchain::{
+    detect::{Tool, require_tools},
+    process,
+};
 use anyhow::Result;
 use colored::Colorize;
-use std::io::{self, Write};
 
-use crate::toolchain::detect::Tool;
-
-/// Interactive guided setup: check each required tool and provide OS-specific
-/// install instructions for any that are missing.
+/// Diagnose compiler, frontend tools and Tauri's native platform requirements.
 pub fn run() -> Result<()> {
-    println!("\n{}", "Revenant — Setup".bold());
-    println!();
-    println!("  Checking required tools...");
-    println!();
-
-    let tools = [Tool::Cargo, Tool::WasmPack, Tool::Node, Tool::Npm];
-    let mut all_ok = true;
-
-    for tool in &tools {
+    println!("\n{}", "Revenant — Desktop toolchain diagnosis".bold());
+    let tools = [Tool::Cargo, Tool::Node, Tool::Npm];
+    for tool in tools {
         if tool.is_available() {
-            println!("  {} {} found", "✓".green().bold(), tool.display_name());
+            println!("  {} {} found", "✓".green(), tool.display_name());
         } else {
-            all_ok = false;
-            println!("  {} {} not found", "✗".red().bold(), tool.display_name());
-            println!();
-            print_install_instructions(*tool);
-            println!();
-
-            wait_for_user("  Press Enter after installing, or Ctrl+C to quit...")?;
-            println!();
-
-            // Re-check
-            if tool.is_available() {
-                println!(
-                    "  {} {} now available",
-                    "✓".green().bold(),
-                    tool.display_name()
-                );
+            println!(
+                "  {} {} missing; install explicitly: {}",
+                "✗".red(),
+                tool.display_name(),
+                tool.install_hint()
+            );
+        }
+    }
+    require_tools(&tools)?;
+    let cwd = std::env::current_dir()?;
+    let compiler = process::run_capture(&cwd, "rustc", &["-vV"], false)?;
+    println!("{compiler}");
+    println!("  Platform prerequisites: https://v2.tauri.app/start/prerequisites/");
+    #[cfg(windows)]
+    {
+        anyhow::ensure!(
+            compiler
+                .lines()
+                .any(|line| line.starts_with("host:") && line.ends_with("-pc-windows-msvc")),
+            "Windows desktop packaging requires the MSVC Rust toolchain. Install Visual Studio C++ Build Tools and select a *-pc-windows-msvc toolchain."
+        );
+        let webview = [
+            r"HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients",
+            r"HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients",
+            r"HKCU\SOFTWARE\Microsoft\EdgeUpdate\Clients",
+        ]
+        .iter()
+        .any(|key| {
+            process::run_capture(
+                &cwd,
+                "reg.exe",
+                &[
+                    "query",
+                    key,
+                    "/s",
+                    "/f",
+                    "Microsoft Edge WebView2 Runtime",
+                    "/d",
+                ],
+                false,
+            )
+            .is_ok()
+        });
+        println!(
+            "  WebView2 registration: {}",
+            if webview {
+                "found"
             } else {
-                println!(
-                    "  {} {} still not found — continuing anyway",
-                    "✗".yellow().bold(),
-                    tool.display_name()
-                );
+                "not found; install the runtime for local development"
             }
-        }
+        );
+        let locator = std::env::var_os("ProgramFiles(x86)")
+            .map(std::path::PathBuf::from)
+            .map(|base| base.join("Microsoft Visual Studio/Installer/vswhere.exe"));
+        let cpp = locator
+            .filter(|path| path.is_file())
+            .and_then(|path| {
+                process::run_capture(
+                    &cwd,
+                    &path.to_string_lossy(),
+                    &[
+                        "-latest",
+                        "-products",
+                        "*",
+                        "-requires",
+                        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                        "-property",
+                        "installationPath",
+                    ],
+                    false,
+                )
+                .ok()
+            })
+            .is_some_and(|path| !path.trim().is_empty())
+            || process::run_capture(&cwd, "where.exe", &["cl.exe"], false).is_ok();
+        println!(
+            "  MSVC C++ tools: {}",
+            if cpp {
+                "installation found"
+            } else {
+                "not found"
+            }
+        );
+        println!("  Native compilation verifies Windows SDK headers and linker availability.");
+        anyhow::ensure!(
+            cpp && webview,
+            "desktop development prerequisites are incomplete: install Visual Studio C++ Build Tools with a Windows SDK and the WebView2 runtime; see https://v2.tauri.app/start/prerequisites/"
+        );
     }
-
-    println!();
-    if all_ok {
-        println!("  {} All tools ready!", "✓".green().bold());
-        println!();
-        println!("  Create a project with:");
-        println!("    revenant new my-app");
-    } else {
-        // Re-check everything at the end
-        let still_missing: Vec<_> = tools.iter().filter(|t| !t.is_available()).collect();
-        if still_missing.is_empty() {
-            println!("  {} All tools ready!", "✓".green().bold());
-            println!();
-            println!("  Create a project with:");
-            println!("    revenant new my-app");
-        } else {
-            println!(
-                "  {} Some tools are still missing. Install them and run 'revenant setup' again.",
-                "▸".yellow().bold()
-            );
-        }
-    }
-    println!();
-
+    #[cfg(target_os = "linux")]
+    process::run_blocking(
+        &cwd,
+        "pkg-config",
+        &["--exists", "webkit2gtk-4.1", "gtk+-3.0"],
+        false,
+    )?;
+    #[cfg(target_os = "macos")]
+    process::run_blocking(&cwd, "xcode-select", &["-p"], false)?;
+    println!(
+        "  Tauri CLI 2 is installed as an application devDependency during revenant new/dev/build."
+    );
     Ok(())
-}
-
-fn wait_for_user(prompt: &str) -> Result<()> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
-    Ok(())
-}
-
-fn print_install_instructions(tool: Tool) {
-    let os = std::env::consts::OS;
-    match (tool, os) {
-        (Tool::Cargo, "windows") => {
-            println!("    Install Rust:");
-            println!("      Download from https://rustup.rs");
-            println!("      Or run: winget install Rustlang.Rustup");
-        }
-        (Tool::Cargo, "macos") => {
-            println!("    Install Rust:");
-            println!("      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh");
-            println!("      Or: brew install rustup && rustup-init");
-        }
-        (Tool::Cargo, _) => {
-            println!("    Install Rust:");
-            println!("      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh");
-        }
-        (Tool::WasmPack, _) => {
-            println!("    Install wasm-pack:");
-            println!("      cargo install wasm-pack");
-        }
-        (Tool::Node | Tool::Npm, "windows") => {
-            println!("    Install Node.js (includes npm):");
-            println!("      Download from https://nodejs.org");
-            println!("      Or run: winget install OpenJS.NodeJS.LTS");
-        }
-        (Tool::Node | Tool::Npm, "macos") => {
-            println!("    Install Node.js (includes npm):");
-            println!("      Download from https://nodejs.org");
-            println!("      Or: brew install node");
-        }
-        (Tool::Node | Tool::Npm, _) => {
-            println!("    Install Node.js (includes npm):");
-            println!("      https://nodejs.org");
-            println!(
-                "      Or via your package manager (apt install nodejs, pacman -S nodejs, etc.)"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::toolchain::detect::Tool;
-
-    #[test]
-    fn cargo_is_available_in_test_env() {
-        // cargo is always available when running cargo test
-        assert!(Tool::Cargo.is_available());
-    }
 }

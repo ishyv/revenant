@@ -1,0 +1,5 @@
+version = 3
+
+[project]
+name = "file-media"
+identifier = "app.revenant.file-media"

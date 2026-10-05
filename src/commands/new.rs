@@ -2,15 +2,14 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::Path;
 
-use crate::bindings;
-use crate::config::WEB_SUBDIR;
+use crate::config::{RevenantConfig, WEB_SUBDIR};
 use crate::errors::RevenantError;
 use crate::scaffold;
 use crate::toolchain::detect::{Tool, require_tools};
 use crate::toolchain::process;
 
 /// Validate a project name: no slashes, spaces, or leading dots.
-fn validate_name(name: &str) -> Result<(), RevenantError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), RevenantError> {
     if name.is_empty() {
         return Err(RevenantError::InvalidProjectName {
             name: name.to_string(),
@@ -35,13 +34,54 @@ fn validate_name(name: &str) -> Result<(), RevenantError> {
             reason: "name cannot contain spaces".to_string(),
         });
     }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !name.starts_with(|c: char| c.is_ascii_alphabetic())
+    {
+        return Err(RevenantError::InvalidProjectName {
+            name: name.into(),
+            reason: "start with an ASCII letter and use letters, numbers, hyphens or underscores"
+                .into(),
+        });
+    }
+    if matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return Err(RevenantError::InvalidProjectName {
+            name: name.into(),
+            reason: "reserved Windows directory name".into(),
+        });
+    }
     Ok(())
 }
 
-/// Scaffold a new Revenant project with the given name.
+/// Scaffold a new desktop project with no required native application source.
 ///
 /// Validates the name, checks for required tools, writes the project template,
-/// and runs `npm install` in the web directory.
+/// installs frontend tools, then compiles the hidden host and publishes its API.
 pub fn run(name: &str, verbose: bool) -> Result<()> {
     validate_name(name)?;
 
@@ -51,7 +91,7 @@ pub fn run(name: &str, verbose: bool) -> Result<()> {
     }
 
     // Check all required tools before doing any work
-    require_tools(&[Tool::Cargo, Tool::WasmPack, Tool::Node, Tool::Npm])?;
+    require_tools(&[Tool::Cargo, Tool::Node, Tool::Npm])?;
 
     println!(
         "\n{}",
@@ -61,9 +101,6 @@ pub fn run(name: &str, verbose: bool) -> Result<()> {
 
     scaffold::create_project(target, name)
         .with_context(|| format!("failed to scaffold project '{name}'"))?;
-    bindings::sync_bindings(target, name)
-        .context("failed to generate the initial Revenant bindings")?;
-
     println!("  {} Project scaffolded", "✓".green().bold());
 
     // Install web dependencies immediately so the project is ready to use
@@ -72,6 +109,9 @@ pub fn run(name: &str, verbose: bool) -> Result<()> {
     process::run_blocking(&web_dir, "npm", &["install"], verbose)
         .with_context(|| format!("npm install failed in {}", web_dir.display()))?;
     println!("  {} Dependencies installed", "✓".green().bold());
+    let config = RevenantConfig::load(target)?;
+    super::build::build_rust(target, &config, false, verbose)
+        .context("initial desktop contract build failed; scaffold is preserved")?;
 
     println!();
     println!("Ready. To start developing:");

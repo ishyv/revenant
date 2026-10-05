@@ -1,218 +1,92 @@
-# Revenant Architecture
+# Revenant 0.3 architecture
 
-Revenant is a CLI tool that bridges Rust/WebAssembly and SvelteKit, providing
-`new`, `dev`, `build`, and `setup` subcommands.
+The application is a native desktop executable with a Svelte webview. Tauri is
+the window and IPC adapter; it does not define the operation authoring API.
+Rust owns resources and execution; the client owns scoped observable projections.
+There is no active WASM worker or HTTP server host.
 
-## Module Layout
+## Source ownership
 
-```
-src/
-├── main.rs              Clap CLI dispatch + error display
-├── lib.rs               Public module re-exports (enables integration tests)
-├── bindings.rs          Rust -> TypeScript contract extraction + facade generation
-├── config.rs            RevenantConfig, revenant.toml I/O, named constants
-├── errors.rs            RevenantError enum (thiserror)
-├── commands/
-│   ├── new.rs           Project scaffolding command
-│   ├── dev.rs           Dev server with WASM watch loop
-│   ├── build.rs         Production build (WASM + web)
-│   └── setup.rs         Interactive tool installation guide
-├── toolchain/
-│   ├── detect.rs        Tool enum + require_tools() availability check
-│   ├── wasm.rs          WasmBuilder trait, WasmPackBuilder, WasmWatcher
-│   └── process.rs       ManagedProcess with I/O pump threads
-└── scaffold/
-    ├── mod.rs           create_project() entry point
-    └── templates.rs     Embedded template constants
-```
+| Package/module | Responsibility |
+| --- | --- |
+| `src/config.rs`, `src/commands/` | Strict version 3 configuration and CLI orchestration |
+| `src/scaffold/`, `templates/` | Minimal author files, local SDK, hidden desktop bootstrap |
+| `src/compiled.rs` | Native contract export, validation, typed facade, atomic publication |
+| `crates/revenant-core/` | Errors, wire-safe contracts, leases and task lifecycle; no Tauri dependency |
+| `crates/revenant-sdk/src/application.rs` | Inert `Application` composition, operation factories and compiled replacements |
+| `crates/revenant-sdk/src/operations/`, `providers/` | Typed registration/dispatch and transactional provider lifecycle |
+| `crates/revenant-macros/` | Contract and operation macros; source metadata and Rustdoc extraction |
+| `crates/revenant-desktop/src/files/` | SQLite folder index, native filters/sort and frozen selections |
+| `crates/revenant-desktop/src/results/` | Disk-backed batch outcomes and bounded pages |
+| `crates/revenant-desktop/src/runtime/` | Scoped admission, views, native jobs, shutdown and IPC dispatch |
+| `crates/revenant-desktop/src/settings.rs` | Bounded validated JSON and atomic persistence |
+| `crates/revenant-desktop/src/previews.rs`, `file_port.rs` | Owned previews and leased chunk reads |
+| `packages/client/src/` | Typed scoped projections, stores, operations and Tauri transport |
+| `packages/client/src/ui/` | Optional Svelte/HyvUI presentation and virtualized collection views |
 
-### Why this structure
+The native adapter is integrated. Compilation, strict Rustdoc, installed-window
+workflows and the large-folder run are recorded in [validation](VALIDATION.md).
 
-The codebase splits into three concerns:
+## Authoring and compiled contract
 
-- **`commands/`** — User-facing CLI logic. Each file maps to a subcommand and
-  orchestrates the other modules. Contains no system interaction beyond calling
-  into `toolchain/` and `scaffold/`.
+An app starts with `revenant.toml` version 3 and `web/`. Built-ins need no native
+source. If `native/Cargo.toml` exists, its library exports
+`pub fn app() -> revenant::Application` using the same local SDK snapshot as the
+generated host. Macros derive schemas, TypeScript types, descriptions and source
+metadata from ordinary Rust definitions across modules.
 
-- **`toolchain/`** — System interaction: spawning processes, detecting tools,
-  building WASM, watching files. This is where platform-specific code lives
-  (Windows `cmd /C` routing, Unix SIGTERM handling).
+`.revenant/desktop/` contains framework-owned Cargo/Tauri configuration and
+bootstrap. It exports the contract before creating a window or acquiring native
+resources. The CLI compiles this executable and runs `--revenant-contract`; it
+does not infer APIs by parsing handwritten source. Version 3 / protocol 2,
+operation IDs, supported definitions and the digest are validated. An immutable
+generation beneath `web/src/lib/.revenant/` is selected by atomic replacement
+of `web/src/lib/revenant.ts`. Failed compile/export keeps the previous facade.
 
-- **`scaffold/`** — Code generation. Templates and directory creation. Pure
-  filesystem writes with no process spawning.
+The generated facade supplies the expected manifest. Root connection checks the
+native manifest/digest before execution. Operation bindings also check schemas;
+stale generated code fails with `incompatible_contract`. Native rebuilds replace
+the executable generation; Vite handles frontend changes.
 
-This separation keeps each module testable in isolation. `commands/` can be
-tested by mocking toolchain calls; `scaffold/` can be tested by writing to a
-temp directory; `toolchain/` logic tests don't need a project structure.
+## Native ownership and bounds
 
-## Key Design Decisions
+Folders are scoped native capabilities. SQLite holds metadata instead of a JS
+inventory or full Rust vector. Windows default to 128 rows, bounded to 512.
+Sorting/filtering operate over the native index. Query generations reject stale
+updates. Explicit selections are limited to 512 leased entries. `allMatching()`
+captures a native query selection for larger work, rather than an array of files.
 
-### Tool detection as prerequisite
+Admission captures inputs and provider generations before returning a task.
+Bounded queues/workers limit execution. Batch outcomes persist to SQLite with
+pages up to 512 rows. Snapshots carry progress and summary counters instead of
+an ever-growing outcome inventory. Application options also bound scopes,
+views, history, JSON size and shutdown grace. A real 500,000-file run verified
+bounded windows, paged outcomes and cleanup; timings are workload-specific.
 
-`revenant new` checks all required tools (cargo, wasm-pack, node, npm) before
-writing any files. This is a deliberate choice over lazy detection:
+The presentation virtualizer receives at most 4,096 rows at a time. First/last,
+adjacent-range controls and a position slider navigate the complete native query.
+This bounds measurement caches and avoids WebView2's finite CSS height limit;
+one folder-wide scroll spacer would make sufficiently distant files unreachable.
 
-- The user gets a single error listing everything they need to install, not a
-  sequence of failures after partial work.
-- Tool probes are cheap (~100ms total for four `--version` subprocess spawns).
-- No partial project directories are left behind on failure.
+Scope teardown requests cancellation and releases owned resources. Executors
+retain captured leases until exit. Subscriptions observe tasks; unsubscribing
+does not stop execution. Cancellation is cooperative, with no universal rollback.
 
-The tradeoff is that `revenant new` checks tools it won't use until later (e.g.,
-`npm` isn't needed until `npm install` at the end). This is acceptable because
-all four tools are always needed for a working project.
+## Persistence and replacement
 
-### No async runtime
+Settings live in native application data. Keys are validated, records bounded
+to 1 MiB, and missing defaults merge without discarding unknown object fields.
+Writes sync a same-directory temporary file and atomically overwrite the record,
+including on Windows. Atomic visibility is not a promise of directory-entry
+survival through power loss. Separate processes are last-writer-wins. Settings
+are not a secret store.
 
-Process management uses OS threads + `mpsc` channels. The dev event loop runs
-on the main thread with a 100ms tick, draining log lines and checking for
-shutdown/rebuild signals.
+Inspection exposes supported provider descriptors, configuration and ownership
+counts. Configuration/replacement validate schemas, operation sets, dependencies
+and idle ownership boundaries. Preparation succeeds before activation; failed
+candidates are cleaned up and the old provider stays active. Alternatives must
+already be compiled into the app. JavaScript is not an execution provider.
 
-The 100ms tick is a deliberate tradeoff: lower wastes CPU cycles polling empty
-channels, higher adds noticeable latency to log output. At 100ms, CPU usage is
-negligible and output feels real-time.
-
-An async runtime (tokio, async-std) would eliminate polling but add significant
-dependency weight and complexity for a tool that manages at most three child
-processes.
-
-### No template engine
-
-All scaffold templates are `const &str` in `templates.rs` with a tiny string
-substitution layer for `{project_name}` and `{wasm_name}`.
-
-The tradeoff: adding conditionals or loops would still be clumsy. If v2
-template variants (minimal, full) need conditional sections, a proper template
-engine may become worthwhile.
-
-### File watching
-
-`wasm-pack` has no `--watch` flag. Revenant owns the watch loop via the `notify`
-crate watching `rust/src/` with a 500ms debounce, spawning a new `wasm-pack`
-process on each change.
-
-Debouncing happens inside the `notify` callback, not in the consumer. A single
-file save can fire 3-5 filesystem events; debouncing at the source prevents
-redundant rebuild signals.
-
-### Generated bindings
-
-After every successful WASM build, Revenant reads `rust/src/lib.rs`, extracts a
-contract from public `#[wasm_bindgen]` exports, writes that manifest to
-`pkg/revenant.contract.json`, and regenerates `web/src/lib/wasm.ts`.
-
-The current bridge strategy is deliberately strict:
-
-- **Supported runtime surface**: primitives, `String`, and typed numeric
-  vectors that `wasm-bindgen` already exposes cleanly.
-- **Supported contract surface**: the manifest understands richer Rust shapes
-  like `Option<T>`, `Result<T, E>`, tuples, structs, and enums.
-- **Failure mode**: if an exported function uses a type the TypeScript contract
-  can describe but the runtime bridge cannot preserve yet, Revenant fails the
-  build with an explicit error instead of emitting `unknown` or `any`.
-
-This keeps the public Svelte API stable and invisible while leaving room for a
-future serialized bridge behind the same generated facade.
-
-### Error handling
-
-Two-layer model: `thiserror` for structured domain errors (`RevenantError`),
-`anyhow` for propagation with context. `main()` walks the error chain and
-prints each cause indented.
-
-Every error message follows a three-part pattern:
-1. What failed
-2. Why it failed (if determinable)
-3. What the user should do next
-
-### Signal handling
-
-`ctrlc` with `termination` feature catches SIGINT/SIGTERM (+ Windows console
-events). The handler sends on an mpsc channel; the dev loop polls it.
-`terminate_with_timeout` sends SIGTERM on Unix (via `nix`) or `child.kill()` on
-Windows, then waits up to 5 seconds before escalating to SIGKILL.
-
-### Auto-install
-
-`detect.rs` will auto-install `wasm-pack` via `cargo install wasm-pack` if it
-is missing. This is a deliberate deviation from the "no auto-install" principle —
-wasm-pack is rarely pre-installed and trivially installable. All other tools
-(cargo, node, npm) require manual installation.
-
-### Verbose mode
-
-The `--verbose` global flag controls child process output visibility.
-`run_blocking` accepts a `verbose: bool` parameter:
-
-- **verbose=true**: inherits stdio (user sees raw output from wasm-pack, npm)
-- **verbose=false**: captures output, only surfaces stderr in error messages
-
-This keeps default output clean while still giving full diagnostics when needed.
-
-### Process management
-
-`toolchain/process.rs` provides two execution models:
-
-- **`run_blocking`** — synchronous execution; verbose mode inherits stdio,
-  quiet mode captures output. Used for one-shot commands (npm install,
-  wasm-pack release build).
-
-- **`ManagedProcess`** — spawns the process with piped stdout/stderr, then
-  creates two reader threads that forward lines as `LogLine` messages to an
-  `mpsc` channel. Used for long-running processes (web dev server, background
-  wasm-pack rebuilds) where output must be labeled and interleaved.
-
-The two-model split exists because `run_blocking` is simpler and preserves
-terminal formatting (colors, progress bars) that piping would lose.
-`ManagedProcess` sacrifices raw terminal output for labeled, interleaved
-streaming from multiple concurrent processes.
-
-### Setup command
-
-`commands/setup.rs` provides an interactive guided setup that checks each tool
-sequentially and provides OS-specific installation instructions. It detects the
-OS via `std::env::consts::OS` and tailors commands for Windows (winget), macOS
-(brew), and Linux (package managers). The setup command never installs anything
-automatically — it guides the user through each step.
-
-### Windows compatibility
-
-All tool invocations on Windows route through `cmd /C` to resolve `.cmd` shims
-(npm, npx). This adds one process to the tree but is necessary because
-`Command::new("npm")` fails on Windows where npm is a `.cmd` script, not a
-binary.
-
-## Extension Points
-
-### v2: Vite plugin
-
-The `WasmBuilder` trait (`toolchain/wasm.rs`) is the seam for v2. A Vite plugin
-could trigger `wasm-pack` on WASM import resolution, removing the need for
-Revenant's custom file watcher entirely. The trait allows swapping the build
-backend without changing command logic.
-
-`TODO(v2)` markers in the codebase:
-- `commands/dev.rs` — Vite plugin replacing the watcher
-- `config.rs` — optional fields (wasi_target, custom watch paths, build flags)
-- `scaffold/mod.rs` — template variants via `--template` flag
-- `bindings.rs` — richer bridge strategies beyond direct `wasm-bindgen` exports
-- `toolchain/detect.rs` — pnpm/yarn/bun support
-- `toolchain/wasm.rs` — WasiBuilder variant
-
-### v3: Transform pipeline
-
-Post-WASM-build transforms (wasm-opt, size reporting, custom codegen) could slot
-in as a trait-based pipeline between `WasmBuilder::build_*()` returning and the
-command reporting success. Each transform would implement a `WasmTransform` trait
-with a `transform(&self, wasm_path: &Path) -> Result<()>` method, chained in
-sequence.
-
-## Tradeoffs Summary
-
-| Decision | Benefit | Cost |
-|----------|---------|------|
-| No async | Simpler code, fewer deps | 100ms polling tick |
-| No template engine | Zero deps for templates | String substitution only; richer templates stay manual |
-| Upfront tool checks | Single error, no partial state | Checks tools not immediately needed |
-| Auto-install wasm-pack only | Pragmatic UX win | Inconsistent with "no auto-install" principle |
-| Windows `cmd /C` | npm works on Windows | Extra process in tree |
-| Two process models | Right tool for each job | Two code paths to maintain |
+See [authoring](AUTHORING.md), [implementation](IMPLEMENTATION.md), and
+[validation](VALIDATION.md). Removed host contracts remain in
+[historical 0.2 documents](history/IMPLEMENTATION-0.2.md).

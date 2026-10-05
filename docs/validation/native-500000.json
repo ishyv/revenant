@@ -1,0 +1,58 @@
+{
+  "date": "2026-10-02",
+  "environment": {
+    "os": "Windows",
+    "processor": "AMD Ryzen 7 5800X, 8 cores / 16 logical processors",
+    "physicalMemoryBytes": 68641636352,
+    "profile": "release",
+    "conditions": "Contended run alongside a previous debug benchmark and application builds; not an isolated performance baseline"
+  },
+  "fixture": {
+    "files": 500000,
+    "shape": "Flat native directory; entry000000.txt through entry499999.txt",
+    "content": "First file contains 43 bytes of text; remaining files are empty",
+    "creationMilliseconds": 195987
+  },
+  "native": {
+    "openingMilliseconds": 0.1422,
+    "indexStoresBeforeQuery": 0,
+    "initialQueryMilliseconds": 74.7463,
+    "discoveryMilliseconds": 58126.7826,
+    "scanCount": 1,
+    "peakProcessMemoryBytes": 56864768,
+    "maxWindowRows": 128,
+    "searchMilliseconds": { "empty": 26.2777, "noMatchFile": 174.5039, "allTxt": 176.811, "noMatchSentinel": 135.0182 },
+    "lastWindowMilliseconds": 147.9769,
+    "checksum": { "succeeded": "500000", "failed": "0", "milliseconds": 359087.1295, "itemsPerSecond": 1392.4197191255778, "firstPageRows": 128, "lastPageRows": 128 },
+    "cancellation": { "state": "partial", "completed": "4", "pageRows": 4, "requestToTerminalMilliseconds": 1290.5945 },
+    "cleanup": { "fileResources": "0", "cacheStores": 0 },
+    "contentReadDuringIndexingInstrumentation": false
+  },
+  "installedDesktop": {
+    "installerExitCode": 0,
+    "toolchainOnChildPath": false,
+    "finalPackageLaunchWithoutDebugger": true,
+    "ownedTcpListenersWithoutDebugger": 0,
+    "embeddedFrontendOfflineReload": true,
+    "nativePicker": "Actual Windows folder picker selected through process-scoped UI Automation",
+    "discovered": 500000,
+    "renderedRows": 14,
+    "virtualizerSegmentRows": 4096,
+    "scrollSurfacePixels": 311296,
+    "lastVisibleFile": "entry499999.txt",
+    "collectedJavaScriptHeapBytesAtLastWindow": 4525752,
+    "partialBatch": { "completed": "2366", "failed": "0", "visibleOutcomeRows": 64, "nextPageFirstOrdinal": "64" },
+    "nativeResourcesAfterRouteDisposal": "0",
+    "activeTasksAfterRouteDisposal": "0",
+    "customRecordOperation": "Succeeded with three normalized records",
+    "settingsAcrossRelaunch": true,
+    "previews": { "pngDecodedPixels": [1, 1], "audioRangeStatus": 206, "invalidRangeStatus": 416, "disposedUrlStatus": 404 },
+    "closeDuringBatchPreparationMilliseconds": 69
+  },
+  "limitations": [
+    "Empty-file hashing does not benchmark large media throughput",
+    "No file-content byte instrumentation was added to discovery",
+    "Existing WebView2 runtime was present; clean-machine offline WebView2 installation remains unverified",
+    "Visual hover popup in Zed remains unverified; actual language-service hover/source results and Zed project discovery passed"
+  ]
+}

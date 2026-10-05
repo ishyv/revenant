@@ -1,5 +1,16 @@
-/target
+target/
 node_modules/
 pkg/
 .svelte-kit/
 build/
+.tooling/
+.revenant/
+*.revenant-stage-*
+_revenant/
+
+# Local agent configuration, instructions, and task-tracker state
+/.agents/
+/.codex/
+/.beads/
+/.beads.gate.lock
+AGENTS.md

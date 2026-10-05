@@ -1,4 +1,4 @@
-name: Rust
+name: Desktop framework
 
 on:
   push:
@@ -10,13 +10,91 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
-
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Compile desktop workspace
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo check --workspace --all-features --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo check -p revenant-desktop --no-default-features --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Public Rust documentation
+        env:
+          RUSTDOCFLAGS: '-D missing_docs -D rustdoc::broken_intra_doc_links'
+        run: |
+          cargo doc -p revenant-core -p revenant-sdk -p revenant-macros -p revenant-desktop --all-features --no-deps --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Install client dependencies
+        working-directory: packages/client
+        run: |
+          npm install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Frontend and API documentation
+        run: |
+          npm run check --prefix packages/client
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run check:ui --prefix packages/client
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node scripts/check-api-docs.mjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      # Formal tests are final-phase gates. Defining them here does not authorize
+      # running them during coordinated implementation.
+      - name: Final-phase formal tests
+        run: |
+          cargo test --workspace --all-features --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm test --prefix packages/client
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build CLI
+        run: |
+          cargo build -p revenant --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build migrated reference applications
+        run: |
+          $cli = (Resolve-Path target/debug/revenant.exe).Path
+          foreach ($project in @('examples/file-media', 'examples/prime-sieve')) {
+            Push-Location $project
+            try {
+              & $cli build
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+              npm run check --prefix web
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            } finally { Pop-Location }
+          }
+      - name: Build standalone desktop scaffold
+        run: |
+          $cli = (Resolve-Path target/debug/revenant.exe).Path
+          Push-Location $env:RUNNER_TEMP
+          try {
+            & $cli new standalone-app
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            Push-Location standalone-app
+            try {
+              & $cli build
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+              npm run check --prefix web
+              if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            } finally { Pop-Location }
+          } finally { Pop-Location }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-windows-build-evidence
+          path: |
+            target/doc
+            examples/file-media/.revenant/target/release/bundle
+            examples/prime-sieve/.revenant/target/release/bundle
+            ${{ runner.temp }}/standalone-app/.revenant/target/release/bundle
+          if-no-files-found: warn

@@ -1,3 +1,4 @@
+//! Actionable CLI diagnostics; nested stage errors retain compiler/tool output.
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,17 +22,17 @@ pub enum RevenantError {
     ProjectNotFound,
 
     #[error(
-        "WASM build failed. Run with --verbose to see full compiler output. Common causes: syntax errors in rust/src/lib.rs, or missing #[wasm_bindgen] on exported functions"
+        "desktop build failed. Run with --verbose for compiler output; check native operations and Tauri platform prerequisites"
     )]
-    WasmBuildFailed,
+    DesktopBuildFailed,
 
     #[error(
-        "web build failed. Run with --verbose for full output. Ensure dependencies are installed (npm install) and the WASM package in pkg/ exists"
+        "web build failed. Run with --verbose for the failing stage; check Svelte diagnostics and web dependencies"
     )]
     WebBuildFailed,
 
     #[error(
-        "dev server crashed unexpectedly. If the port is in use, stop other dev servers or set a custom port in web/vite.config.js"
+        "Vite crashed unexpectedly. If the port is in use, stop the conflicting process or set desktop.dev_port in revenant.toml and restart revenant dev"
     )]
     DevServerCrashed,
 }
