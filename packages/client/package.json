@@ -1,9 +1,21 @@
 {
   "name": "@revenant/client",
-  "version": "0.3.0",
+  "version": "0.4.0",
+  "revenant": { "compatibility": 4 },
+  "engines": { "node": ">=24 <25" },
+  "imports": {
+    "#schema-library": {
+      "node": "./src/schema-library.cjs",
+      "default": "json-schema-library"
+    }
+  },
   "type": "module",
   "sideEffects": false,
   "exports": {
+    "./vite": {
+      "types": "./vite.d.ts",
+      "default": "./vite.js"
+    },
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
@@ -21,10 +33,12 @@
   "scripts": {
     "check": "tsc --noEmit",
     "check:ui": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "tsx --test tests/runtime.test.mjs"
+    "check:contracts": "tsx scripts/check-contracts.mjs",
+    "test": "tsx --test tests/*.test.mjs",
+    "test:ui": "node --conditions=browser --conditions=svelte --import tsx --test tests/ui/*.test.mjs"
   },
   "dependencies": {
-    "ajv": "^8.17.1",
+    "json-schema-library": "11.6.4",
     "@tauri-apps/api": "2.12.1",
     "@tanstack/svelte-virtual": "3.13.39"
   },
@@ -37,10 +51,16 @@
       "optional": true
     }
   },
+  "overrides": {
+    "svelte-language-server": { "svelte": "$svelte" }
+  },
   "devDependencies": {
-    "svelte": "^5.0.0",
-    "svelte-check": "^4.0.0",
-    "typescript": "^5.7.0",
+    "jsdom": "^26.1.0",
+    "ajv": "8.20.0",
+    "svelte": "5.57.2",
+    "svelte-check": "4.7.6",
+    "svelte-language-server": "0.18.4",
+    "typescript": "6.0.3",
     "tsx": "^4.23.15",
     "@hyvnt/hyvui": "file:../../vendor/hyvui-1.0.0.tgz"
   }

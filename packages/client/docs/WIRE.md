@@ -1,10 +1,17 @@
-# Native dispatcher wire (stable 0.3)
+# Native dispatcher wire (0.4)
 
 The authoritative client types are [`src/wire.ts`](../src/wire.ts), with data models
 in [`src/contracts.ts`](../src/contracts.ts) and [`src/files.ts`](../src/files.ts).
-Manifest version is **3**, protocol is **2**. The generated operation descriptor
-format retains `id`, `description`, `input`, `output` and optional
+Manifest version is **6**, protocol is **5**, and SDK/client compatibility revision is **4**.
+The generated operation descriptor carries `arguments`, `effect`, `independent`
+and `agent`, along with `id`, `description`, `input`, `output`, optional `updates`, and optional
 `source: {file, line, module}`.
+
+Frontend requests carry a bounded `requestId`, correlated with native task
+admission, execution, completion and errors. Trace retention is bounded and
+excludes arguments/results. Development connections additionally report bounded
+frontend errors and route/title/visibility state, with source authority retained
+in native runtime data. Production rejects frontend diagnostic snapshots.
 
 ```ts
 import { Channel, invoke } from "@tauri-apps/api/core";
@@ -40,11 +47,14 @@ scope creation. Other fields below are in addition to `action` and that scope.
 | `root.connect`      | none                                                  | `{scope, manifest}`                                                                |
 | `scope.create`      | `parent: string`                                      | `{scope: string}`                                                                  |
 | `scope.dispose`     | none                                                  | void                                                                               |
+| `resource.release`  | `handle: Handle`                                      | void; native owner revoked, existing leases retained                               |
 | `folder.open`       | none                                                  | `{folder: string, name: string, path: string, bookmark: {path: string}}` or null |
 | `folder.reopen`     | `bookmark: {path: string}`                            | `FolderDescriptor` or null                                                         |
 | `folder.dispose`    | `folder: string`                                      | void                                                                               |
 | `folder.query`      | `folder, options, generation, offset, limit`          | `{view: string, snapshot: FileCollectionSnapshot}`                                 |
 | `view.query`        | `view, options, generation, offset, limit`            | `{view: string, snapshot: FileCollectionSnapshot}`                                 |
+| `view.refresh`      | `view, options, generation, offset, limit`            | Fresh collection-owned inventory; `{view, snapshot}` and scan Channel updates       |
+| `view.cancel`       | `view`                                               | void; release collection discovery ownership, preserving admitted batch inventory leases |
 | `view.window`       | `view, generation, offset, limit`                     | `FileCollectionSnapshot`                                                           |
 | `view.ack`          | `view: string, revision: number`                      | void; may publish the next coalesced Channel page                                  |
 | `view.dispose`      | `view`                                                | void                                                                               |
@@ -107,7 +117,7 @@ objects**, including explicitly selected `handles` and preview `handle`. `path` 
 presentation-only. Size is an unsigned decimal string; modified follows core's
 optional string representation.
 
-Query generation starts at 1 and advances on `FileCollection.query/filter/sort`.
+Query generation starts at 1 and advances on `FileCollection.query/filter/sort/refresh`.
 This is a **client query generation**, not the index's scan revision. Host snapshots
 must echo it even when more files are discovered. Old query streams can continue
 briefly but their snapshots are discarded and still acknowledged. `revision` is
@@ -116,10 +126,22 @@ the native monotonically increasing page publication counter **within one view**
 the query generation and the publication revision. These native u64 fields are
 JSON numbers; progress, summary and outcome ordinals use decimal strings.
 
-`view.query` always creates a replacement view from the previous view's folder,
-so recursive traversal changes can select another index. It returns a new `view`
+`view.query` creates a replacement view using the previous view's inventory.
+A recursion change starts a fresh inventory for that collection. It returns a new `view`
 and initial snapshot. The client retires the previous view after its in-flight
 viewport and ACK work has completed; query readiness never waits on that cleanup.
+
+`view.refresh` always starts a fresh inventory for this collection, preserving
+query options. Its initial invoke is admission, while the public `refresh()`
+promise waits for a current terminal scan snapshot. Later query/sort changes
+inherit this inventory rather than returning to the folder's original cache.
+Other collections keep their previous inventories. Refresh resets offset and
+increments the selection generation immediately. Abort/supersession rejects
+the associated public promise; returned pages are still ACKed and retired.
+The host holds explicit discovery leases for active views and admitted matching
+batches. Retiring the last such owner cancels scanning even if the worker still
+owns its storage. A cancellation leaves partial metadata; another explicit
+refresh creates a usable inventory. Already admitted batch inputs remain pinned.
 
 Native publication retains the prior page handles until its replacement's ACK.
 Only one replacement can await acknowledgement, with at most two windows of

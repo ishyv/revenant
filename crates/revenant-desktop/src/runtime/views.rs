@@ -9,7 +9,7 @@ use crate::{
     file_port::FilePort,
     files::{FileQuery, FolderIndex, IndexState},
 };
-use revenant_core::FileEntry;
+use revenant_core::{FileEntry, FolderHandle, NativeFolder};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -24,11 +24,41 @@ use std::{
 pub(crate) struct IndexRun {
     pub index: Arc<FolderIndex>,
     pub cancelled: Arc<AtomicBool>,
+    recursive: bool,
+    users: Mutex<usize>,
+}
+// Worker Arcs keep storage alive, but do not authorize continued discovery.
+// Collections and admitted all-matching batches hold these explicit leases.
+pub(crate) struct IndexLease {
+    run: Arc<IndexRun>,
+}
+impl IndexRun {
+    pub(crate) fn retain(self: &Arc<Self>) -> Result<IndexLease> {
+        let mut users = lock(&self.users);
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(Error::new(
+                "index_cancelled",
+                "Refresh this cancelled inventory before using it",
+            ));
+        }
+        *users += 1;
+        Ok(IndexLease { run: self.clone() })
+    }
+}
+impl Drop for IndexLease {
+    fn drop(&mut self) {
+        let mut users = lock(&self.run.users);
+        *users -= 1;
+        if *users == 0 {
+            self.run.cancelled.store(true, Ordering::Release);
+        }
+    }
 }
 pub(crate) struct FolderRecord {
     pub id: String,
     pub scope: String,
     pub path: PathBuf,
+    pub capability: FolderHandle,
     pub indexes: Mutex<HashMap<bool, Arc<IndexRun>>>,
 }
 impl Drop for FolderRecord {
@@ -43,6 +73,7 @@ pub(crate) struct ViewRecord {
     pub scope: String,
     pub folder: Arc<FolderRecord>,
     pub index: Arc<IndexRun>,
+    scan_lease: Mutex<Option<IndexLease>>,
     pub query: Mutex<FileQuery>,
     pub window: Mutex<(u64, u32)>,
     pub generation: AtomicU64,
@@ -65,44 +96,33 @@ impl DesktopRuntime {
     /// confirmation or upload occurs. Traversal starts only when a view is created.
     pub fn open_folder(&self, scope: &str, path: PathBuf) -> Result<Value> {
         self.accepting()?;
-        self.scope_window(scope)?;
+        self.scope_owner(scope)?;
         if lock(&self.inner.folders).len() >= self.inner.options.max_views {
             return Err(Error::new(
                 "folder_limit",
                 "Too many owned folders; dispose folders no longer in use",
             ));
         }
-        let metadata = std::fs::symlink_metadata(&path).map_err(super::io_error)?;
-        #[cfg(windows)]
-        let reparse = {
-            use std::os::windows::fs::MetadataExt;
-            metadata.file_attributes() & 0x400 != 0
-        };
-        #[cfg(not(windows))]
-        let reparse = false;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() || reparse {
-            return Err(Error::new(
-                "invalid_folder",
-                "Choose a directory that is not a symbolic link or junction",
-            ));
-        }
-        let path = std::fs::canonicalize(path).map_err(super::io_error)?;
+        let native_folder = NativeFolder::open(&path)?;
+        let path = native_folder.path().to_path_buf();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let folder = id("folder");
+        let capability = self.inner.resources.register_native(scope, native_folder)?;
         lock(&self.inner.folders).insert(
             folder.clone(),
             Arc::new(FolderRecord {
                 id: folder.clone(),
                 scope: scope.into(),
                 path: path.clone(),
+                capability: capability.clone(),
                 indexes: Mutex::new(HashMap::new()),
             }),
         );
         Ok(
-            json!({"folder":folder,"name":name,"path":path.to_string_lossy(),"bookmark":{"path":path.to_string_lossy()}}),
+            json!({"folder":folder,"capability":capability,"name":name,"path":path.to_string_lossy(),"bookmark":{"path":path.to_string_lossy()}}),
         )
     }
 
@@ -133,11 +153,19 @@ impl DesktopRuntime {
         Ok(view)
     }
 
-    fn index(&self, folder: &Arc<FolderRecord>, recursive: bool) -> Result<Arc<IndexRun>> {
+    fn index(&self, folder: &Arc<FolderRecord>, recursive: bool) -> Result<IndexLease> {
         let mut indexes = lock(&folder.indexes);
-        if let Some(index) = indexes.get(&recursive) {
-            return Ok(index.clone());
+        if let Some(index) = indexes.get(&recursive)
+            && let Ok(lease) = index.retain()
+        {
+            return Ok(lease);
         }
+        let lease = self.fresh_index(folder, recursive)?;
+        indexes.insert(recursive, lease.run.clone());
+        Ok(lease)
+    }
+
+    fn fresh_index(&self, folder: &Arc<FolderRecord>, recursive: bool) -> Result<IndexLease> {
         let admission = self
             .inner
             .admission
@@ -147,14 +175,25 @@ impl DesktopRuntime {
         let index = Arc::new(IndexRun {
             index: FolderIndex::new(folder.path.clone(), &self.inner.cache_dir, recursive)?,
             cancelled: Arc::new(AtomicBool::new(false)),
+            recursive,
+            users: Mutex::new(0),
         });
-        indexes.insert(recursive, index.clone());
+        let lease = index.retain()?;
         let runtime = self.clone();
         let run = index.clone();
         let folder_id = folder.id.clone();
         tokio::spawn(async move {
-            let Ok(worker) = runtime.inner.workers.clone().acquire_owned().await else {
-                return;
+            let worker = loop {
+                if run.cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::select! {
+                    permit = runtime.inner.workers.clone().acquire_owned() => {
+                        let Ok(permit) = permit else { return; };
+                        break permit;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
             };
             let rt = runtime.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -178,7 +217,8 @@ impl DesktopRuntime {
                                 continue;
                             }
                             if let Ok(snapshot) = rt.publish_view(&view) {
-                                if let Some(sink) = lock(&view.sink).clone() {
+                                let sink = lock(&view.sink).clone();
+                                if let Some(sink) = sink {
                                     sink(snapshot);
                                 }
                             }
@@ -188,7 +228,7 @@ impl DesktopRuntime {
             })
             .await;
         });
-        Ok(index)
+        Ok(lease)
     }
 
     /// Creates a reactive native query; returned snapshots contain at most 512 entries.
@@ -202,10 +242,65 @@ impl DesktopRuntime {
         self.query_folder_at(scope, folder_id, options, sink, 0, 128, 1)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserves the existing query IPC scope, options, sink, pagination and generation fields"
+    )]
     pub(crate) fn query_folder_at(
         &self,
         scope: &str,
         folder_id: &str,
+        options: Value,
+        sink: Option<UpdateSink>,
+        offset: u64,
+        limit: u32,
+        generation: u64,
+    ) -> Result<Value> {
+        let folder = self.folder(scope, folder_id)?;
+        self.create_view(
+            scope, folder, None, false, options, sink, offset, limit, generation,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserves the existing query IPC pagination, generation and refresh fields"
+    )]
+    pub(crate) fn query_view_at(
+        &self,
+        scope: &str,
+        view_id: &str,
+        options: Value,
+        sink: Option<UpdateSink>,
+        offset: u64,
+        limit: u32,
+        generation: u64,
+        refresh: bool,
+    ) -> Result<Value> {
+        let previous = self.view(scope, view_id)?;
+        self.create_view(
+            scope,
+            previous.folder.clone(),
+            Some(previous.index.clone()),
+            refresh,
+            options,
+            sink,
+            offset,
+            limit,
+            generation,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Combines existing query IPC fields with captured folder and index ownership"
+    )]
+    fn create_view(
+        &self,
+        scope: &str,
+        folder: Arc<FolderRecord>,
+        inherited: Option<Arc<IndexRun>>,
+        refresh: bool,
         options: Value,
         sink: Option<UpdateSink>,
         offset: u64,
@@ -222,7 +317,6 @@ impl DesktopRuntime {
         if lock(&self.inner.views).len() >= self.inner.options.max_views {
             return Err(Error::new("view_limit", "Too many active file views"));
         }
-        let folder = self.folder(scope, folder_id)?;
         let recursive = options
             .get("recursive")
             .and_then(Value::as_bool)
@@ -235,7 +329,20 @@ impl DesktopRuntime {
             query_options["sort"] = Value::String("path".into());
         }
         let query: FileQuery = serde_json::from_value(query_options)?;
-        let index = self.index(&folder, recursive)?;
+        let scan_lease = if refresh {
+            self.fresh_index(&folder, recursive)?
+        } else if let Some(index) = inherited {
+            if index.recursive == recursive {
+                index.retain()?
+            } else {
+                // A changed traversal belongs to this collection's lineage. It
+                // must never select another collection's older folder cache.
+                self.fresh_index(&folder, recursive)?
+            }
+        } else {
+            self.index(&folder, recursive)?
+        };
+        let index = scan_lease.run.clone();
         // Validate query before publication; malformed ordering never creates a view.
         index.index.query(&query, 0, 128)?;
         let view = Arc::new(ViewRecord {
@@ -243,6 +350,7 @@ impl DesktopRuntime {
             scope: scope.into(),
             folder,
             index,
+            scan_lease: Mutex::new(Some(scan_lease)),
             query: Mutex::new(query),
             window: Mutex::new((offset, limit)),
             generation: AtomicU64::new(generation),
@@ -257,7 +365,13 @@ impl DesktopRuntime {
             dirty: AtomicBool::new(false),
         });
         lock(&self.inner.views).insert(view.id.clone(), view.clone());
-        Ok(json!({"view":view.id,"snapshot":self.publish_view(&view)?}))
+        match self.publish_view(&view) {
+            Ok(snapshot) => Ok(json!({"view":view.id,"snapshot":snapshot})),
+            Err(error) => {
+                let _ = self.dispose_view(scope, &view.id);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn publish_view(&self, view: &Arc<ViewRecord>) -> Result<Value> {
@@ -340,6 +454,17 @@ impl DesktopRuntime {
         let revision = view.revision.fetch_add(1, Ordering::AcqRel) + 1;
         let snapshot = json!({"view":view.id,"items":entries,"offset":page.offset,"limit":limit,"total":page.total,"discovered":page.discovered,"state":state,
             "generation":generation,"revision":revision,"indexGeneration":page.generation,"warnings":warnings,"warningCount":page.warnings.total});
+        let mut snapshot = snapshot;
+        if state == "failed" {
+            snapshot["error"] = serde_json::to_value(Error::new(
+                if page.state == IndexState::Cancelled {
+                    "index_cancelled"
+                } else {
+                    "index_failed"
+                },
+                "Folder discovery did not complete; refresh the collection to retry",
+            ))?;
+        }
         *lock(&view.published) = Some(snapshot.clone());
         Ok(snapshot)
     }
@@ -412,6 +537,13 @@ impl DesktopRuntime {
             }
         }
         lock(&self.inner.views).remove(view_id);
+        lock(&view.scan_lease).take();
+        Ok(())
+    }
+
+    pub(crate) fn cancel_view_scan(&self, scope: &str, view_id: &str) -> Result<()> {
+        let view = self.view(scope, view_id)?;
+        lock(&view.scan_lease).take();
         Ok(())
     }
 
@@ -432,7 +564,8 @@ impl DesktopRuntime {
         drop(publishing);
         if refresh {
             let snapshot = self.publish_view(&view)?;
-            if let Some(sink) = lock(&view.sink).clone() {
+            let sink = lock(&view.sink).clone();
+            if let Some(sink) = sink {
                 sink(snapshot);
             }
         }
@@ -441,7 +574,10 @@ impl DesktopRuntime {
 
     /// Releases folder ownership; existing views and admitted batches keep their leases.
     pub fn dispose_folder(&self, scope: &str, folder_id: &str) -> Result<()> {
-        self.folder(scope, folder_id)?;
+        let folder = self.folder(scope, folder_id)?;
+        self.inner
+            .resources
+            .release(scope, folder.capability.handle())?;
         lock(&self.inner.folders).remove(folder_id);
         Ok(())
     }

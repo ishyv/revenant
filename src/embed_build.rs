@@ -44,9 +44,12 @@ fn collect(root: &Path, relative: &Path, files: &mut Vec<(String, Vec<u8>)>) {
             child.extension().and_then(|x| x.to_str()),
             Some(
                 "rs" | "ts"
+                    | "cts"
+                    | "cjs"
                     | "svelte"
                     | "css"
                     | "js"
+                    | "mjs"
                     | "json"
                     | "toml"
                     | "sql"
@@ -56,6 +59,9 @@ fn collect(root: &Path, relative: &Path, files: &mut Vec<(String, Vec<u8>)>) {
                     | "ico"
                     | "icns"
                     | "md"
+                    | "wgsl"
+                    | "ttf"
+                    | "txt"
             )
         ) {
             files.push((
@@ -74,6 +80,8 @@ fn main() {
         "crates/revenant-sdk",
         "crates/revenant-macros",
         "crates/revenant-desktop",
+        "crates/revenant-agent",
+        "crates/revenant-graphics",
         "packages/client",
     ] {
         println!("cargo:rerun-if-changed={base}");

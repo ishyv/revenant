@@ -167,7 +167,11 @@ export interface TaskSummary {
   failed: string;
 }
 /** Native task projection. Batch outcomes are paged; this compatibility field stays bounded. */
-export interface TaskSnapshot<O = unknown> {
+export interface TaskSnapshot<O = unknown, U = unknown> {
+  /** Monotonic native mutation revision, preventing stale channel/refresh replacement. */
+  revision?: string;
+  /** Latest bounded application update; intermediate revisions are replaceable. */
+  update?: TaskUpdate<U>;
   /** Native task identity; empty in the local pre-admission projection. */
   id: string;
   /** Native task owner scope; empty until native admission. */
@@ -186,6 +190,13 @@ export interface TaskSnapshot<O = unknown> {
   cancelRequested: boolean;
   /** Lossless decimal counts for retained batch outcomes. */
   summary: TaskSummary;
+}
+/** Application data snapshot separate from task progress and terminal result. */
+export interface TaskUpdate<U = unknown> {
+  /** Native task mutation revision at publication. */
+  revision: string;
+  /** Compiled-schema data limited to 64 KiB encoded JSON. */
+  value: U;
 }
 /** Bounded page from a native result set. */
 export interface ResultPage<O> {
@@ -209,6 +220,16 @@ export interface TypeDefinition {
 }
 /** Registration format retained by generated $lib/revenant facades. */
 export interface OperationDefinition {
+  /** Named wire fields synthesized from Rust arguments; empty for legacy inputs. */
+  arguments: string[];
+  /** Author declaration used for query helpers and tool descriptions. */
+  effect: "unknown" | "readOnly" | "write";
+  /** Declared scheduling class; omitted metadata defaults to ordinary CPU work. */
+  workClass?: "cpu" | "io" | "interactive";
+  /** Explicit eligibility for bounded overlapping batch execution. */
+  independent: boolean;
+  /** Explicit author exposure to application agents. Native dispatch enforces it. */
+  agent: boolean;
   /** Stable compiled operation registration identity. */
   id: string;
   /** Rust documentation published with the operation registration. */
@@ -217,6 +238,8 @@ export interface OperationDefinition {
   input: TypeDefinition;
   /** Compiled output declaration and its authoritative schema. */
   output: TypeDefinition;
+  /** Optional compiled contract for the operation's task.updates store. */
+  updates?: TypeDefinition;
   /** Optional Rust definition location for IDE navigation. */
   source?: {
     /** Source file containing the registered Rust operation definition. */
@@ -229,10 +252,10 @@ export interface OperationDefinition {
 }
 /** Desktop compiled contract format. */
 export interface ContractManifest {
-  /** Desktop contract format version; this client requires version three. */
-  version: 3;
-  /** Desktop dispatcher protocol version; this client requires protocol two. */
-  protocol: 2;
+  /** Desktop contract format version; this client requires version six. */
+  version: 6;
+  /** Desktop dispatcher protocol version; this client requires protocol five. */
+  protocol: 5;
   /** Compiled contract digest used to reject incompatible application generations. */
   digest: string;
   /** Compiled native registrations available to generated operation bindings. */
@@ -270,6 +293,42 @@ export function assertJson(value: unknown): void {
     seen.delete(v);
   };
   visit(value);
+}
+/** Capture detached lossless JSON, including reactive plain-object proxies. */
+export function cloneJson<T>(value: T): T {
+  const ancestors = new Set<object>();
+  const copy = (v: unknown): unknown => {
+    if (v === null || typeof v === "string" || typeof v === "boolean") return v;
+    if (typeof v === "number" && Number.isFinite(v) &&
+      (!Number.isInteger(v) || Number.isSafeInteger(v))) return v;
+    if (typeof v !== "object" || !v || ancestors.has(v))
+      failure("invalid_json", "Expected finite, lossless JSON data");
+    if (!Array.isArray(v) && Object.getPrototypeOf(v) !== Object.prototype &&
+      Object.getPrototypeOf(v) !== null)
+      failure("invalid_json", "Expected a plain JSON object");
+    ancestors.add(v);
+    let result: unknown;
+    if (Array.isArray(v)) result = Array.from({ length: v.length }, (_, index) => copy(v[index]));
+    else {
+      const object: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(v)) {
+        // Define data keys without invoking Object.prototype setters.
+        Object.defineProperty(object, key, { value: copy(item), enumerable: true, writable: true, configurable: true });
+      }
+      result = object;
+    }
+    ancestors.delete(v);
+    return result;
+  };
+  try {
+    return copy(value) as T;
+  } catch (error) {
+    // Some reactive runtimes return a fresh proxy at each link in a cycle.
+    // Preserve a classified boundary error when object identity cannot detect it.
+    if (error instanceof RangeError)
+      failure("invalid_json", "JSON data is cyclic or nested too deeply");
+    throw error;
+  }
 }
 /** Validate a native window or selection bound without silently clamping intent. */
 export function windowBounds(offset = 0, limit = 128): {

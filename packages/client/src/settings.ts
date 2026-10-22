@@ -1,5 +1,5 @@
 /** Settings are local observable projections of native atomic persistence. */
-import { assertJson, errorOf, failure } from "./contracts.js";
+import { assertJson, cloneJson, errorOf, failure } from "./contracts.js";
 import type { RuntimeError } from "./contracts.js";
 import { Signal } from "./store.js";
 import type { Readable } from "./store.js";
@@ -23,18 +23,19 @@ function compatible(defaults: unknown, value: unknown): boolean {
   if (Array.isArray(defaults))
     return (
       Array.isArray(value) &&
-      (defaults.length === 0 ||
-        value.every((item) => compatible(defaults[0], item)))
+      value.every(
+        (item, index) =>
+          index >= defaults.length || compatible(defaults[index], item),
+      )
     );
   if (typeof defaults === "object") {
     if (!value || typeof value !== "object" || Array.isArray(value))
       return false;
     const properties = Object.entries(defaults as object);
     return (
-      Object.keys(value).length === properties.length &&
       properties.every(
         ([key, expected]) =>
-          key in value &&
+          Object.hasOwn(value, key) &&
           compatible(expected, (value as Record<string, unknown>)[key]),
       )
     );
@@ -75,8 +76,8 @@ export class Settings<T extends Record<string, unknown>>
     assertJson(defaults);
     if (!options.key)
       failure("invalid_settings_key", "Native settings require a nonempty key");
-    this.defaults = structuredClone(defaults);
-    this.store = new Signal(freeze(structuredClone(defaults)));
+    this.defaults = cloneJson(defaults);
+    this.store = new Signal(freeze(cloneJson(defaults)));
     this.subscribe = this.store.subscribe;
     owner.own(this);
     this.ready = owner
@@ -88,7 +89,7 @@ export class Settings<T extends Record<string, unknown>>
       .then((value) => {
         if (this.disposed) return;
         this.validate(value);
-        if (this.revision === 0) this.store.set(freeze(structuredClone(value)));
+        if (this.revision === 0) this.store.set(freeze(cloneJson(value)));
         this.status.set({ state: this.revision ? "dirty" : "saved" });
       })
       .catch((error) => {
@@ -104,7 +105,7 @@ export class Settings<T extends Record<string, unknown>>
 
   /** Defensive copy of the latest local value. */
   get value(): T {
-    return structuredClone(this.store.current);
+    return cloneJson(this.store.current);
   }
   private validate(value: unknown): void {
     assertJson(value);
@@ -119,9 +120,10 @@ export class Settings<T extends Record<string, unknown>>
   /** Update immediately and automatically queue native persistence. */
   set(value: T): void {
     this.assert();
-    this.validate(value);
+    const captured = cloneJson(value);
+    this.validate(captured);
     this.revision++;
-    this.store.set(freeze(structuredClone(value)));
+    this.store.set(freeze(captured));
     this.status.set({ state: "dirty" });
     void this.flush().catch(() => {});
   }
@@ -138,7 +140,7 @@ export class Settings<T extends Record<string, unknown>>
       const scope = await this.owner.ready;
       while (this.savedRevision < this.revision) {
         const revision = this.revision;
-        const value = structuredClone(this.store.current);
+        const value = cloneJson(this.store.current);
         if (!this.disposed) this.status.set({ state: "saving" });
         // Parent teardown waits for this save queue before closing the native scope.
         await this.owner.transport.dispatch({

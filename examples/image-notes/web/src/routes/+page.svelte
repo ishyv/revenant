@@ -1,44 +1,86 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import { confirm } from "@revenant/client";
-  import { useApp } from "$lib/revenant";
-  import LibrarySidebar from "$lib/components/LibrarySidebar.svelte";
-  import Gallery from "$lib/components/Gallery.svelte";
-  import ImageInspector from "$lib/components/ImageInspector.svelte";
-  import { libraryQuery } from "$lib/models/library-query";
-  import { noteEditor } from "$lib/models/note-editor";
-  import { scanModel } from "$lib/models/scan";
-  import { coordinator } from "$lib/models/coordinator";
-  import { createImageRenderer } from "$lib/image-queue";
+  import { confirm, askSaveChanges, onDesktopCloseRequested } from "@revenant/client";
+  import type { Unsubscribe } from "@revenant/client";
+  import { useApp, useOperations } from "#lib/revenant.ts";
+  import LibrarySidebar from "#lib/components/LibrarySidebar.svelte";
+  import Gallery from "#lib/components/Gallery.svelte";
+  import ImageInspector from "#lib/components/ImageInspector.svelte";
+  import { libraryQuery } from "#lib/models/library-query.ts";
+  import { noteEditor } from "#lib/models/note-editor.ts";
+  import { noteCloseGuard } from "#lib/models/note-close.ts";
+  import { scanModel } from "#lib/models/scan.ts";
+  import { coordinator } from "#lib/models/coordinator.ts";
+  import { createImageRenderer } from "#lib/image-queue.ts";
   import {
     message,
     type Asset,
     type ImageRenderer,
     type Root,
     type ScanReport,
-  } from "$lib/types";
+    type CacheUsage,
+  } from "#lib/types.ts";
 
   const app = useApp();
-  const operations = app.operations.images;
+  const operations = useOperations(app).images;
   const library = libraryQuery(operations);
   const editor = noteEditor(operations.annotate, library.noteSaved);
   const scan = scanModel(operations.scan);
   const navigation = coordinator(editor);
-  let render = $state<ImageRenderer>(createImageRenderer(operations.render));
+  let render = $state<ImageRenderer>(createImageRenderer(operations.render, reportError));
   let search = $state("");
   let adding = $state(false);
   let error = $state("");
+  let cacheUsage = $state<CacheUsage>();
+  let clearingCache = $state(false);
   let alive = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopClose: Unsubscribe | undefined;
+  const closeGuard = noteCloseGuard(editor, () => askSaveChanges(
+    "¿Guardar los cambios de tu anotación antes de cerrar Luma?",
+    { save: "Guardar", discard: "Descartar", cancel: "Cancelar" },
+  ));
   const currentRoot = $derived($library.roots.find((root) => root.id === $library.rootId));
   const displayedError = $derived(error || $editor.error || $library.error || $scan.error);
 
   onMount(() => {
     void library.start().catch(reportError);
+    void loadCacheUsage();
+    void onDesktopCloseRequested(closeGuard.decide, {
+      canClose: closeGuard.canClose,
+      onError: reportError,
+    }).then((stop) => {
+      if (alive) stopClose = stop;
+      else stop();
+    }).catch(reportError);
   });
 
   function reportError(failure: unknown) {
     if (alive) error = message(failure);
+  }
+
+  async function loadCacheUsage() {
+    try {
+      const usage = await operations.cacheUsage({});
+      if (alive) cacheUsage = usage;
+    } catch (failure) { reportError(failure); }
+  }
+
+  async function clearCache() {
+    if (clearingCache) return;
+    clearingCache = true;
+    try {
+      if (!await confirm("¿Limpiar las imágenes en caché? Se volverán a generar cuando las abras. Tus notas y originales se conservan.")) return;
+      const result = await operations.clearCache({});
+      if (!alive) return;
+      cacheUsage = result.usage;
+      render = createImageRenderer(operations.render, reportError);
+    } catch (failure) { reportError(failure); }
+    finally { if (alive) clearingCache = false; }
+  }
+
+  function cacheMiB(bytes: string) {
+    return (Number(bytes) / 1048576).toFixed(1);
   }
 
   async function act(
@@ -141,7 +183,7 @@
       // Do not hold navigation behind a long scan. Flush notes again at
       // completion, since users can keep writing while indexing runs.
       await act(async () => {
-        render = createImageRenderer(operations.render);
+        render = createImageRenderer(operations.render, reportError);
         await library.refreshRoots();
         await library.chooseRoot(result.rootId, $library.annotatedOnly, search);
       });
@@ -158,7 +200,7 @@
 
   async function removeRoot(root: Root) {
     await act(async () => {
-      await operations.removeRoot.call({ id: root.id });
+      await operations.removeRoot({ id: root.id });
       if (!alive) return;
       if ($editor.asset?.rootId === root.id) editor.select();
       await library.refreshRoots();
@@ -195,6 +237,7 @@
 
   onDestroy(() => {
     alive = false;
+    stopClose?.();
     clearTimeout(timer);
     navigation.dispose();
     editor.dispose();
@@ -247,6 +290,14 @@
         />
         <kbd>Ctrl K</kbd>
       </label>
+      <div class="cache-actions">
+        <button class="subtle-button" title="Actualizar uso de caché" onclick={() => void loadCacheUsage()}>
+          Caché {cacheUsage ? `${cacheMiB(cacheUsage.bytes)} / ${cacheMiB(cacheUsage.budgetBytes)} MiB` : "…"}
+        </button>
+        <button class="subtle-button" disabled={clearingCache || !$library.ready} onclick={() => void clearCache()}>
+          {clearingCache ? "Limpiando…" : "Limpiar caché"}
+        </button>
+      </div>
     </header>
     <div class="workspace-body" class:has-inspector={!!$editor.asset}>
       <Gallery

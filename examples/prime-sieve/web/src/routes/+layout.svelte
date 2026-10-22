@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { createApp, provideApp } from '$lib/revenant';
+  import { createApp, provideApp } from '#lib/revenant.ts';
   import type { Snippet } from 'svelte';
   import '@hyvnt/hyvui/styles.css';
   import '@hyvnt/hyvui/fonts.css';

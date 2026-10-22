@@ -22,10 +22,6 @@ pub const APP: &[(&str, &str)] = &[
         include_str!("../../templates/app/web/package.json.tpl"),
     ),
     (
-        "web/svelte.config.js",
-        include_str!("../../templates/app/web/svelte.config.js.tpl"),
-    ),
-    (
         "web/vite.config.js",
         include_str!("../../templates/app/web/vite.config.js.tpl"),
     ),

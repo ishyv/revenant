@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { useApp } from '$lib/revenant';
+  import { useApp } from '#lib/revenant.ts';
   const app = useApp();
 </script>
 

@@ -15,7 +15,7 @@ export interface NoteSnapshot {
  * Writes are serialized; the committed note changes without replacing the draft.
  */
 export function noteEditor(
-  annotate: Pick<ImageOperations["annotate"], "call">,
+  annotate: (input: Parameters<ImageOperations["annotate"]>[0]) => Promise<SavedNote>,
   onSaved: (saved: SavedNote) => void = () => {},
 ) {
   let state: NoteSnapshot = {
@@ -41,7 +41,7 @@ export function noteEditor(
       const version = selection;
       publish({ ...state, status: "saving", error: "" });
       try {
-        const saved = await annotate.call({ id: asset.id, note });
+        const saved = await annotate({ id: asset.id, note });
         if (!alive) return false;
         if (version === selection) {
           const dirty = state.draft !== saved.note;
@@ -59,6 +59,9 @@ export function noteEditor(
         }
         return false;
       }
+    }
+    if (alive && !state.dirty && state.status === "saving") {
+      publish({ ...state, status: "saved", error: "" });
     }
     return alive;
   }

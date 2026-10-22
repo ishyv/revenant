@@ -50,6 +50,7 @@ pub struct TestProvider {
     cleanup_calls: Arc<AtomicUsize>,
     file_cleanup_calls: Arc<AtomicUsize>,
     cleanup_saw_file_disposal: Arc<AtomicBool>,
+    descriptor_change: Option<fn(&mut revenant_sdk::OperationDescriptor)>,
 }
 
 impl TestProvider {
@@ -64,6 +65,7 @@ impl TestProvider {
             cleanup_calls: Arc::new(AtomicUsize::new(0)),
             file_cleanup_calls: Arc::new(AtomicUsize::new(0)),
             cleanup_saw_file_disposal: Arc::new(AtomicBool::new(false)),
+            descriptor_change: None,
         }
     }
 
@@ -139,7 +141,7 @@ impl Provider for TestProvider {
     fn operations(&self) -> Result<Vec<OperationRegistration>> {
         let operation_id = self.operation_id();
         let gate = self.operation_gate.clone();
-        let operation = OperationRegistration::new::<u32, u32, _, _>(
+        let mut operation = OperationRegistration::new::<u32, u32, _, _>(
             operation_id,
             "Returns its input after the optional test gate.",
             move |input, _context| {
@@ -156,6 +158,9 @@ impl Provider for TestProvider {
                 }
             },
         )?;
+        if let Some(change) = self.descriptor_change {
+            change(&mut operation.descriptor);
+        }
         Ok(vec![operation])
     }
 
@@ -200,12 +205,13 @@ impl Provider for TestProvider {
     }
 }
 
-fn setup() -> (OperationRegistry, TaskManager) {
+fn setup() -> (OperationRegistry, TaskManager, String) {
     let resources = ResourceRegistry::new();
-    resources.create_scope("operation-scope", None).unwrap();
+    let scope = resources.create_scope(None).unwrap();
     (
         OperationRegistry::with_resources(resources.clone()),
         TaskManager::new(resources),
+        scope,
     )
 }
 
@@ -213,8 +219,8 @@ fn install(registry: &OperationRegistry, provider: Arc<TestProvider>) {
     block_on(registry.install(provider, json!({}))).unwrap();
 }
 
-fn task(tasks: &TaskManager, id: &str) -> TaskContext {
-    tasks.create("operation-scope", id).unwrap()
+fn task(tasks: &TaskManager, scope: &str, id: &str) -> TaskContext {
+    tasks.create(scope, id).unwrap()
 }
 
 fn active_count(registry: &OperationRegistry, id: &str) -> u64 {
@@ -235,7 +241,7 @@ fn wait_for_gate(started: Receiver<()>) {
 
 #[test]
 fn failed_prepare_disposes_candidate_resources_before_provider_cleanup() {
-    let (registry, _tasks) = setup();
+    let (registry, _tasks, _scope) = setup();
     let candidate =
         Arc::new(TestProvider::new("candidate", &[]).failing_after_registering_resource());
     let file_cleanup_calls = candidate.file_cleanup_calls.clone();
@@ -254,13 +260,13 @@ fn failed_prepare_disposes_candidate_resources_before_provider_cleanup() {
 
 #[test]
 fn active_dependent_tasks_make_replacing_their_provider_busy() {
-    let (registry, tasks) = setup();
+    let (registry, tasks, scope) = setup();
     install(&registry, Arc::new(TestProvider::new("a", &[])));
     let (operation_gate, started, release) = gate();
     let dependent = Arc::new(TestProvider::new("b", &["a"]).with_operation_gate(operation_gate));
     install(&registry, dependent);
 
-    let context = task(&tasks, "dependent-call");
+    let context = task(&tasks, &scope, "dependent-call");
     let registry_for_worker = registry.clone();
     let worker =
         thread::spawn(move || block_on(registry_for_worker.dispatch("b.run", json!(7), context)));
@@ -290,14 +296,14 @@ fn active_dependent_tasks_make_replacing_their_provider_busy() {
 
 #[test]
 fn an_unrelated_active_provider_does_not_block_replacement() {
-    let (registry, tasks) = setup();
+    let (registry, tasks, scope) = setup();
     install(&registry, Arc::new(TestProvider::new("a", &[])));
     let (operation_gate, started, release) = gate();
     let unrelated =
         Arc::new(TestProvider::new("unrelated", &[]).with_operation_gate(operation_gate));
     install(&registry, unrelated);
 
-    let context = task(&tasks, "unrelated-call");
+    let context = task(&tasks, &scope, "unrelated-call");
     let registry_for_worker = registry.clone();
     let worker = thread::spawn(move || {
         block_on(registry_for_worker.dispatch("unrelated.run", json!(9), context))
@@ -324,7 +330,7 @@ fn an_unrelated_active_provider_does_not_block_replacement() {
 
 #[test]
 fn preparation_reserves_dependents_and_new_dependencies_but_keeps_unrelated_dispatch_live() {
-    let (registry, tasks) = setup();
+    let (registry, tasks, scope) = setup();
     install(&registry, Arc::new(TestProvider::new("dependency", &[])));
     install(&registry, Arc::new(TestProvider::new("a", &[])));
     install(&registry, Arc::new(TestProvider::new("dependent", &["a"])));
@@ -341,7 +347,7 @@ fn preparation_reserves_dependents_and_new_dependencies_but_keeps_unrelated_disp
     let dependent_error = block_on(registry.dispatch(
         "dependent.run",
         json!(1),
-        task(&tasks, "reserved-dependent"),
+        task(&tasks, &scope, "reserved-dependent"),
     ))
     .unwrap_err();
     assert_eq!(dependent_error.code, "provider_busy");
@@ -349,7 +355,7 @@ fn preparation_reserves_dependents_and_new_dependencies_but_keeps_unrelated_disp
     let dependency_error = block_on(registry.dispatch(
         "dependency.run",
         json!(2),
-        task(&tasks, "reserved-new-dependency"),
+        task(&tasks, &scope, "reserved-new-dependency"),
     ))
     .unwrap_err();
     assert_eq!(dependency_error.code, "provider_busy");
@@ -357,7 +363,7 @@ fn preparation_reserves_dependents_and_new_dependencies_but_keeps_unrelated_disp
     let unrelated_result = block_on(registry.dispatch(
         "unrelated.run",
         json!(3),
-        task(&tasks, "unreserved-provider"),
+        task(&tasks, &scope, "unreserved-provider"),
     ))
     .unwrap();
     assert_eq!(unrelated_result, json!(3));
@@ -376,8 +382,46 @@ fn preparation_reserves_dependents_and_new_dependencies_but_keeps_unrelated_disp
 }
 
 #[test]
+fn replacement_preserves_every_digest_bearing_operation_descriptor_field() {
+    let registry = OperationRegistry::new();
+    block_on(registry.install(Arc::new(TestProvider::new("stable", &[])), json!({}))).unwrap();
+    let before = registry.manifest().unwrap().digest;
+    let changes: [fn(&mut revenant_sdk::OperationDescriptor); 7] = [
+        |descriptor| descriptor.work_class = revenant_sdk::WorkClass::Io,
+        |descriptor| descriptor.agent = true,
+        |descriptor| descriptor.effect = revenant_sdk::OperationEffect::Write,
+        |descriptor| descriptor.independent = true,
+        |descriptor| descriptor.arguments.push("input".into()),
+        |descriptor| descriptor.description.push_str(" Changed documentation."),
+        |descriptor| {
+            descriptor.source = Some(revenant_sdk::OperationSource {
+                file: "changed.rs".into(),
+                line: 2,
+                module: "changed".into(),
+            })
+        },
+    ];
+    for change in changes {
+        let mut candidate = TestProvider::new("stable", &[]);
+        candidate.descriptor_change = Some(change);
+        let candidate = Arc::new(candidate);
+        let error = block_on(registry.replace("stable", candidate.clone(), json!({}))).unwrap_err();
+        assert_eq!(error.code, "provider_contract_mismatch");
+        assert_eq!(candidate.cleanup_count(), 1);
+        assert_eq!(registry.manifest().unwrap().digest, before);
+    }
+    block_on(registry.replace(
+        "stable",
+        Arc::new(TestProvider::new("stable", &[])),
+        json!({}),
+    ))
+    .unwrap();
+    assert_eq!(registry.manifest().unwrap().digest, before);
+}
+
+#[test]
 fn dependency_cycles_roll_back_the_candidate_and_keep_the_active_provider() {
-    let (registry, tasks) = setup();
+    let (registry, tasks, scope) = setup();
     install(&registry, Arc::new(TestProvider::new("a", &[])));
     install(&registry, Arc::new(TestProvider::new("b", &["a"])));
     let candidate = Arc::new(TestProvider::new("a", &["b"]));
@@ -394,20 +438,23 @@ fn dependency_cycles_roll_back_the_candidate_and_keep_the_active_provider() {
     assert_eq!(active.generation, 1);
     assert_eq!(active.dependencies, Vec::<String>::new());
 
-    let result =
-        block_on(registry.dispatch("a.run", json!(11), task(&tasks, "old-provider-still-works")))
-            .unwrap();
+    let result = block_on(registry.dispatch(
+        "a.run",
+        json!(11),
+        task(&tasks, &scope, "old-provider-still-works"),
+    ))
+    .unwrap();
     assert_eq!(result, json!(11));
 }
 
 #[test]
 fn prepared_queued_operation_pins_transitive_dependencies_until_guard_drop() {
-    let (registry, tasks) = setup();
+    let (registry, tasks, scope) = setup();
     install(&registry, Arc::new(TestProvider::new("a", &[])));
     install(&registry, Arc::new(TestProvider::new("b", &["a"])));
     install(&registry, Arc::new(TestProvider::new("c", &["b"])));
     let prepared = registry.prepare_operation("c.run").unwrap();
-    let context = task(&tasks, "queued-generation");
+    let context = task(&tasks, &scope, "queued-generation");
     prepared.prepare_input(&json!(13), &context).unwrap();
     assert_eq!(context.snapshot().state, revenant_sdk::TaskState::Queued);
     assert_eq!(prepared.descriptor().id, "c.run");

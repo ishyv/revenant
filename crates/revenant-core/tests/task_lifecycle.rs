@@ -30,11 +30,11 @@ fn metadata() -> FileMetadata {
     }
 }
 
-fn setup() -> (ResourceRegistry, TaskManager) {
+fn setup() -> (ResourceRegistry, TaskManager, String) {
     let resources = ResourceRegistry::new();
-    resources.create_scope("scope", None).unwrap();
+    let scope = resources.create_scope(None).unwrap();
     let tasks = TaskManager::new(resources.clone());
-    (resources, tasks)
+    (resources, tasks, scope)
 }
 
 fn terminal_json(context: &revenant_core::TaskContext) -> serde_json::Value {
@@ -43,7 +43,7 @@ fn terminal_json(context: &revenant_core::TaskContext) -> serde_json::Value {
 
 #[test]
 fn cancelling_a_queued_task_is_terminal_and_releases_its_lease() {
-    let (resources, tasks) = setup();
+    let (resources, tasks, scope) = setup();
     let cleaned = Arc::new(AtomicUsize::new(0));
     let cleaned_by_hook = cleaned.clone();
     let cleanup: Arc<dyn ResourceCleanup> = Arc::new(move |_handle: &Handle| {
@@ -51,19 +51,19 @@ fn cancelling_a_queued_task_is_terminal_and_releases_its_lease() {
     });
     let entry = resources
         .register_file_owned(
-            "scope",
+            &scope,
             metadata(),
             Arc::new(TestReader),
             Some("provider"),
             Some(cleanup),
         )
         .unwrap();
-    let context = tasks.create("scope", "queued").unwrap();
+    let context = tasks.create(&scope, "queued").unwrap();
     context.lease(&entry.handle).unwrap();
 
-    resources.release("scope", &entry.handle).unwrap();
+    resources.release(&scope, &entry.handle).unwrap();
     assert_eq!(resources.provider_resource_count("provider"), 1);
-    let cancelled = tasks.cancel("scope", "queued").unwrap();
+    let cancelled = tasks.cancel(&scope, "queued").unwrap();
 
     assert_eq!(cancelled.state, TaskState::Cancelled);
     assert!(cancelled.cancel_requested);
@@ -74,11 +74,11 @@ fn cancelling_a_queued_task_is_terminal_and_releases_its_lease() {
 
 #[test]
 fn a_running_task_stays_cancelling_until_its_executor_acknowledges() {
-    let (_resources, tasks) = setup();
-    let context = tasks.create("scope", "running").unwrap();
+    let (_resources, tasks, scope) = setup();
+    let context = tasks.create(&scope, "running").unwrap();
     let execution = context.begin().unwrap();
 
-    let requested = tasks.cancel("scope", "running").unwrap();
+    let requested = tasks.cancel(&scope, "running").unwrap();
     assert_eq!(requested.state, TaskState::Cancelling);
     assert!(requested.cancel_requested);
 
@@ -113,7 +113,7 @@ fn a_running_task_stays_cancelling_until_its_executor_acknowledges() {
 
 #[test]
 fn dropping_an_executor_marks_interruption_and_releases_leases() {
-    let (resources, tasks) = setup();
+    let (resources, tasks, scope) = setup();
     let cleaned = Arc::new(AtomicUsize::new(0));
     let cleaned_by_hook = cleaned.clone();
     let cleanup: Arc<dyn ResourceCleanup> = Arc::new(move |_handle: &Handle| {
@@ -121,17 +121,17 @@ fn dropping_an_executor_marks_interruption_and_releases_leases() {
     });
     let entry = resources
         .register_file_owned(
-            "scope",
+            &scope,
             metadata(),
             Arc::new(TestReader),
             Some("provider"),
             Some(cleanup),
         )
         .unwrap();
-    let context = tasks.create("scope", "interrupted").unwrap();
+    let context = tasks.create(&scope, "interrupted").unwrap();
     context.lease(&entry.handle).unwrap();
     let execution = context.begin().unwrap();
-    resources.release("scope", &entry.handle).unwrap();
+    resources.release(&scope, &entry.handle).unwrap();
 
     drop(execution);
 
@@ -155,8 +155,8 @@ fn dropping_an_executor_marks_interruption_and_releases_leases() {
 
 #[test]
 fn child_observes_parent_cancellation_before_and_after_parent_finalization() {
-    let (_resources, tasks) = setup();
-    let parent = tasks.create("scope", "parent").unwrap();
+    let (_resources, tasks, scope) = setup();
+    let parent = tasks.create(&scope, "parent").unwrap();
     let execution = parent.begin().unwrap();
     let running_child = parent.batch_child(0, 2).unwrap();
     let queued_child = parent.batch_child(1, 2).unwrap();
@@ -191,9 +191,43 @@ fn child_observes_parent_cancellation_before_and_after_parent_finalization() {
 }
 
 #[test]
+fn independent_children_keep_progress_local_and_observe_parent_cancellation() {
+    let (_resources, tasks, scope) = setup();
+    let parent = tasks.create(&scope, "parallel-parent").unwrap();
+    let execution = parent.begin().unwrap();
+    let early = parent.independent_batch_child(0, 2).unwrap();
+    let late = parent.independent_batch_child(1, 2).unwrap();
+    let early_execution = early.begin().unwrap();
+    let late_execution = late.begin().unwrap();
+    for child in [&late, &early] {
+        child
+            .progress(Progress {
+                completed: 3_u64.into(),
+                total: Some(8_u64.into()),
+                message: Some("Reading".into()),
+            })
+            .unwrap();
+    }
+    assert_eq!(parent.snapshot().progress.completed.get(), 0);
+    assert_eq!(early.snapshot().progress.completed.get(), 3);
+    parent.request_cancel().unwrap();
+    assert_eq!(early.checkpoint().unwrap_err().code, "cancelled");
+    assert_eq!(late.checkpoint().unwrap_err().code, "cancelled");
+    early_execution
+        .finish(Err(revenant_core::Error::cancelled()))
+        .unwrap();
+    late_execution
+        .finish(Err(revenant_core::Error::cancelled()))
+        .unwrap();
+    execution
+        .finish_batch(serde_json::json!({"paged":true}), true)
+        .unwrap();
+}
+
+#[test]
 fn cancelled_batch_without_success_retains_descriptor_and_failure_counters() {
-    let (_resources, tasks) = setup();
-    let context = tasks.create("scope", "cancelled-batch").unwrap();
+    let (_resources, tasks, scope) = setup();
+    let context = tasks.create(&scope, "cancelled-batch").unwrap();
     let execution = context.begin().unwrap();
     context.record_batch_outcome(false).unwrap();
     context.request_cancel().unwrap();
@@ -210,8 +244,8 @@ fn cancelled_batch_without_success_retains_descriptor_and_failure_counters() {
 
 #[test]
 fn ordinary_success_does_not_acknowledge_a_cancel_request() {
-    let (_resources, tasks) = setup();
-    let context = tasks.create("scope", "ignored-cancel").unwrap();
+    let (_resources, tasks, scope) = setup();
+    let context = tasks.create(&scope, "ignored-cancel").unwrap();
     let execution = context.begin().unwrap();
     context.request_cancel().unwrap();
     let snapshot = execution.finish(Ok(serde_json::json!(42))).unwrap();
@@ -229,8 +263,8 @@ fn unacknowledged_batch_cancellation_uses_recorded_success_and_failure_counters(
         (vec![false, false], TaskState::Failed),
         (vec![true, false], TaskState::Partial),
     ] {
-        let (_resources, tasks) = setup();
-        let context = tasks.create("scope", "summary-batch").unwrap();
+        let (_resources, tasks, scope) = setup();
+        let context = tasks.create(&scope, "summary-batch").unwrap();
         let execution = context.begin().unwrap();
         for &success in &outcomes {
             context.record_batch_outcome(success).unwrap();
@@ -257,8 +291,8 @@ fn unacknowledged_batch_cancellation_uses_recorded_success_and_failure_counters(
 }
 
 #[test]
-fn host_interrupt_after_grace_deadline_releases_leases_and_rejects_late_finish() {
-    let (resources, tasks) = setup();
+fn host_interrupt_keeps_leases_until_actual_executor_exit_and_rejects_late_finish() {
+    let (resources, tasks, scope) = setup();
     let cleaned = Arc::new(AtomicUsize::new(0));
     let cleaned_by_hook = cleaned.clone();
     let cleanup: Arc<dyn ResourceCleanup> = Arc::new(move |_handle: &Handle| {
@@ -266,16 +300,16 @@ fn host_interrupt_after_grace_deadline_releases_leases_and_rejects_late_finish()
     });
     let entry = resources
         .register_file_owned(
-            "scope",
+            &scope,
             metadata(),
             Arc::new(TestReader),
             Some("provider"),
             Some(cleanup),
         )
         .unwrap();
-    let context = tasks.create("scope", "late-worker").unwrap();
+    let context = tasks.create(&scope, "late-worker").unwrap();
     context.lease(&entry.handle).unwrap();
-    resources.release("scope", &entry.handle).unwrap();
+    resources.release(&scope, &entry.handle).unwrap();
     let execution = context.begin().unwrap();
     context.record_batch_outcome(true).unwrap();
     context.request_cancel().unwrap();
@@ -289,8 +323,8 @@ fn host_interrupt_after_grace_deadline_releases_leases_and_rejects_late_finish()
     assert_eq!(snapshot.error.unwrap().code, "interrupted");
     assert_eq!(snapshot.summary.succeeded.get(), 1);
     assert_eq!(snapshot.summary.completed.get(), 1);
-    assert_eq!(resources.provider_resource_count("provider"), 0);
-    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    assert_eq!(resources.provider_resource_count("provider"), 1);
+    assert_eq!(cleaned.load(Ordering::SeqCst), 0);
     let before = terminal_json(&context);
     assert_eq!(
         execution

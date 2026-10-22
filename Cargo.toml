@@ -1,6 +1,6 @@
 [package]
 name = "revenant"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Build native desktop applications with Svelte and typed Rust capabilities"
 license = "MIT"
@@ -8,11 +8,11 @@ build = "src/embed_build.rs"
 
 [workspace]
 resolver = "2"
-members = ["crates/revenant-core", "crates/revenant-sdk", "crates/revenant-macros", "crates/revenant-desktop"]
+members = ["crates/revenant-core", "crates/revenant-sdk", "crates/revenant-macros", "crates/revenant-desktop", "crates/revenant-agent", "crates/revenant-graphics"]
 exclude = ["examples", "examples/*", "apps", "apps/*", ".tooling", ".revenant", "generated-template", "generated-templates", "generated-template/*", "generated-templates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 
@@ -32,6 +32,10 @@ notify     = "8.0"
 ctrlc      = { version = "3.4", features = ["termination"] }
 sha2       = "0.10"
 dunce      = "1"
+semver     = "1"
+revenant-core = { version = "0.4.0", path = "crates/revenant-core" }
+revenant-agent = { version = "0.4.0", path = "crates/revenant-agent" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"

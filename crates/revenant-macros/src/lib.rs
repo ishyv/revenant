@@ -7,6 +7,7 @@ use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
 mod contract;
 mod operation;
+mod projection;
 mod safety;
 
 fn sdk() -> Tokens {
@@ -22,17 +23,33 @@ fn expand_result(result: syn::Result<Tokens>) -> TokenStream {
     result.unwrap_or_else(|e| e.to_compile_error()).into()
 }
 
-/// Exposes an ordinary async Rust function as a typed application operation.
+/// Exposes an ordinary sync or async Rust function as a typed application operation.
 ///
-/// `id = "group.name"` selects its generated capability path. Rustdoc supplies
-/// hover documentation unless `description` overrides it. Input and output must
-/// satisfy the compiled contract; an optional second argument is TaskContext.
-/// The function remains callable as Rust, and operations! consumes a hidden factory.
+/// `id = "group.name"` overrides the inferred module/function path. Rustdoc supplies
+/// hover documentation unless `description` overrides it. Owned named arguments
+/// generate the input record; an optional final argument is TaskContext. Return a
+/// plain contract value or Revenant Result. `read_only`, `independent`, and `agent`
+/// declare effects, batch scheduling, and application-agent exposure separately.
+/// `work = "io"` selects blocking I/O; `work = "interactive"` reserves read
+/// responsiveness and requires `read_only`. Undeclared work defaults to CPU.
+/// `legacy_input` preserves a single argument's original wire shape for migration.
+/// The function remains callable as Rust; app! discovers its hidden registration.
 /// Invalid signatures or attributes produce a compile error; registration can fail
 /// at application validation if IDs or wire contracts conflict.
 #[proc_macro_attribute]
 pub fn operation(attr: TokenStream, item: TokenStream) -> TokenStream {
     operation::attribute(attr, item)
+}
+
+/// Defines `pub fn app() -> Application` using this crate's annotated operations.
+///
+/// With no arguments, starts from Application::new(). Pass an Application builder
+/// expression to configure capabilities or explicitly include dependency operations.
+/// Linker discovery excludes other packages and other crates in the same package;
+/// the compiled manifest checks duplicate operation IDs before native startup.
+#[proc_macro]
+pub fn app(input: TokenStream) -> TokenStream {
+    operation::app(input)
 }
 
 /// Composes documented operations using their original source function paths.
@@ -66,4 +83,14 @@ pub fn contract(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_derive(Contract, attributes(serde))]
 pub fn derive_contract(item: TokenStream) -> TokenStream {
     contract::derive(item)
+}
+
+/// Generates a lossless boundary model and reversible owned conversions.
+/// Named source models generate `<Model>Wire` with ordinary contract metadata.
+/// Wide integer fields require `#[wire(decimal)]`; `#[wire(id)]` preserves
+/// nominal String newtypes. `#[wire(contract)]` retains explicit boundary types.
+/// Unsupported shapes produce diagnostics on the source field.
+#[proc_macro_derive(WireProjection, attributes(wire))]
+pub fn derive_wire_projection(item: TokenStream) -> TokenStream {
+    projection::derive(item)
 }

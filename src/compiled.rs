@@ -27,7 +27,12 @@ struct Operation {
     description: String,
     input: Definition,
     output: Definition,
+    updates: Option<Definition>,
     source: Option<OperationSource>,
+    arguments: Vec<String>,
+    effect: String,
+    independent: bool,
+    agent: bool,
 }
 #[derive(Deserialize)]
 struct Definition {
@@ -46,11 +51,27 @@ struct OperationSource {
 pub struct BuildStage {
     root: PathBuf,
     pub directory: PathBuf,
+    source_identity: Option<String>,
+    build_attempt: Option<String>,
 }
 impl BuildStage {
     /// Allocate staging beside published generations, on the same filesystem.
     pub fn new(root: &Path) -> Result<Self> {
+        Self::new_with_source_identity(
+            root,
+            crate::inspection::latest_build_source_fingerprint(root)?,
+            None,
+        )
+    }
+
+    /// Capture the exact precompile identity, independent of later build attempts.
+    pub fn new_with_source_identity(
+        root: &Path,
+        source_identity: Option<String>,
+        build_attempt: Option<String>,
+    ) -> Result<Self> {
         let root = dunce::canonicalize(root)?;
+        crate::scaffold::sdk::check(&root)?;
         let base = root.join("web/src/lib/.revenant");
         std::fs::create_dir_all(&base)?;
         let stamp = std::time::SystemTime::now()
@@ -58,13 +79,37 @@ impl BuildStage {
             .as_nanos();
         let directory = base.join(format!(".stage-{}-{stamp}", std::process::id()));
         std::fs::create_dir(&directory)?;
-        Ok(Self { root, directory })
+        Ok(Self {
+            root,
+            directory,
+            source_identity,
+            build_attempt,
+        })
     }
 
     /// Export without launching an app window, validate, then publish atomically.
     /// Stdout must contain exactly one manifest; logging belongs on stderr.
     pub fn publish(&self, executable: &Path, verbose: bool) -> Result<String> {
-        let json = process::run_capture(
+        let outcome = self.publish_inner(executable, verbose);
+        if let Err(error) = &outcome
+            && self.root.join(".revenant/inspection/build.json").is_file()
+        {
+            crate::inspection::record_build_finish(
+                &self.root,
+                false,
+                vec![crate::inspection::Diagnostic::error(
+                    "contract",
+                    "contract_publication_failed",
+                    format!("{error:#}"),
+                )],
+            )?;
+        }
+        outcome
+    }
+
+    fn publish_inner(&self, executable: &Path, verbose: bool) -> Result<String> {
+        crate::scaffold::sdk::check(&self.root)?;
+        let json = process::run_capture_data(
             &self.root,
             &executable.to_string_lossy(),
             &["--revenant-contract"],
@@ -74,8 +119,9 @@ impl BuildStage {
         let manifest: Manifest = serde_json::from_str(&json)
             .context("native --revenant-contract must print only manifest JSON")?;
         anyhow::ensure!(
-            manifest.version == 3 && manifest.protocol == 2,
-            "compiled desktop contract requires version 3 / protocol 2; regenerate the SDK snapshot with Revenant 0.3"
+            manifest.version == revenant_core::CONTRACT_MANIFEST_VERSION
+                && manifest.protocol == revenant_core::BRIDGE_PROTOCOL_VERSION,
+            "compiled desktop contract requires version 6 / protocol 5; regenerate the SDK snapshot with Revenant 0.4"
         );
         anyhow::ensure!(
             manifest.digest.starts_with("sha256:")
@@ -87,6 +133,9 @@ impl BuildStage {
         let mut hash = Sha256::new();
         hash.update(json.as_bytes());
         hash.update(template.as_bytes());
+        if let Some(identity) = &self.source_identity {
+            hash.update(identity.as_bytes());
+        }
         let generation = format!("{:x}", hash.finalize());
         let facade = generate_facade(&manifest, &json, &generation, &self.root)?;
         std::fs::write(self.directory.join("facade.ts"), facade)?;
@@ -94,7 +143,8 @@ impl BuildStage {
         std::fs::write(
             self.directory.join("generation.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"version":3,"protocol":2,"digest":manifest.digest,"generation":generation}),
+                &serde_json::json!({"version":revenant_core::CONTRACT_MANIFEST_VERSION,"protocol":revenant_core::BRIDGE_PROTOCOL_VERSION,"sdkRevision":revenant_core::SDK_COMPATIBILITY_REVISION,"digest":manifest.digest,"generation":generation,
+                    "sourceFingerprint":self.source_identity,"buildAttempt":self.build_attempt}),
             )?,
         )?;
         let destination = self
@@ -107,8 +157,9 @@ impl BuildStage {
                 .context("publish immutable native contract generation")?;
         }
         let entry = format!(
-            "// Generated from compiled Rust; do not edit.\nexport * from './.revenant/{generation}/facade';\nexport {{ default }} from './.revenant/{generation}/facade';\n"
+            "// Generated from compiled Rust; do not edit.\nexport * from './.revenant/{generation}/facade.ts';\nexport {{ default }} from './.revenant/{generation}/facade.ts';\n"
         );
+        crate::scaffold::sdk::check(&self.root)?;
         atomic_write(&self.root.join("web/src/lib/revenant.ts"), entry.as_bytes())?;
         Ok(generation)
     }
@@ -140,11 +191,15 @@ fn generate_facade(
     let mut names = BTreeSet::from([
         "App".into(),
         "Operation".into(),
+        "OperationFunction".into(),
+        "ReadOperationFunction".into(),
         "ContractManifest".into(),
         "Application".into(),
         "RuntimeApp".into(),
     ]);
     let mut operations = BTreeMap::<String, BindingNode>::new();
+    let mut callables = BTreeMap::<String, BindingNode>::new();
+    let mut callable_types = BTreeMap::<String, BindingNode>::new();
     let mut types = BTreeMap::<String, BindingNode>::new();
     let mut files = BTreeMap::<String, BindingNode>::new();
     let mut file_types = BTreeMap::<String, BindingNode>::new();
@@ -153,6 +208,14 @@ fn generate_facade(
     let mut checksum_type = String::from("unknown");
     let mut metadata_type = String::from("unknown");
     for (index, op) in manifest.operations.iter().enumerate() {
+        anyhow::ensure!(
+            matches!(op.effect.as_str(), "unknown" | "readOnly" | "write")
+                && op.arguments.iter().all(|name| !name.is_empty())
+                && op.arguments.iter().collect::<BTreeSet<_>>().len() == op.arguments.len(),
+            "invalid execution metadata for {}",
+            op.id
+        );
+        let _execution_flags = (op.independent, op.agent);
         anyhow::ensure!(
             !op.id.is_empty() && ids.insert(&op.id),
             "duplicate or empty compiled operation id"
@@ -167,7 +230,14 @@ fn generate_facade(
         }
         let docs = operation_docs(op, root);
         output.push_str(&format!("{docs}export namespace {name} {{\n"));
-        for (direction, definition) in [("Input", &op.input), ("Output", &op.output)] {
+        for (direction, definition) in [("Input", &op.input), ("Output", &op.output)]
+            .into_iter()
+            .chain(
+                op.updates
+                    .as_ref()
+                    .map(|definition| ("Updates", definition)),
+            )
+        {
             anyhow::ensure!(
                 !definition.typescript.trim().is_empty()
                     && (definition.schema.is_object() || definition.schema.is_boolean()),
@@ -180,12 +250,37 @@ fn generate_facade(
         output.push_str("}\n");
         let input = format!("{name}.Input.ContractValue");
         let result = format!("{name}.Output.ContractValue");
+        let generic_types = if op.updates.is_some() {
+            format!("{input}, {result}, {name}.Updates.ContractValue")
+        } else {
+            format!("{input}, {result}")
+        };
         match op.id.as_str() {
             "files.checksum" => checksum_type = result.clone(),
             "media.readMetadata" => metadata_type = result.clone(),
             _ => {}
         }
         let path: Vec<_> = op.id.split('.').collect();
+        insert_binding(
+            &mut callables,
+            &path,
+            format!(
+                "callableOperation(runtime.bindOperation<{generic_types}>(contract.operations[{index}]), {})",
+                op.effect == "readOnly"
+            ),
+            docs.clone(),
+        )?;
+        let callable_type = if op.effect == "readOnly" {
+            "ReadOperationFunction"
+        } else {
+            "OperationFunction"
+        };
+        insert_binding(
+            &mut callable_types,
+            &path,
+            format!("{callable_type}<{generic_types}>"),
+            docs.clone(),
+        )?;
         // Compiled built-ins extend the capability objects without replacing
         // their native picker/preview methods. Custom operations remain separate.
         let (bindings, declarations, binding_path) = match op.id.as_str() {
@@ -196,13 +291,13 @@ fn generate_facade(
         insert_binding(
             bindings,
             binding_path,
-            format!("runtime.bindOperation<{input}, {result}>(contract.operations[{index}])"),
+            format!("runtime.bindOperation<{generic_types}>(contract.operations[{index}])"),
             docs.clone(),
         )?;
         insert_binding(
             declarations,
             binding_path,
-            format!("Operation<{input}, {result}>"),
+            format!("Operation<{generic_types}>"),
             docs,
         )?;
     }
@@ -217,6 +312,8 @@ fn generate_facade(
             ("files", &render_bindings(&files)?),
             ("media", &render_bindings(&media)?),
             ("operations", &render_bindings(&operations)?),
+            ("callables", &render_bindings(&callables)?),
+            ("callable_types", &render_bindings(&callable_types)?),
         ],
     ));
     Ok(output)

@@ -4,11 +4,16 @@ pub(super) struct TaskData {
     pub(super) snapshot: TaskSnapshot,
     pub(super) started: bool,
     pub(super) leases: HashMap<String, ResourceLease>,
+    pub(super) native_leases: HashMap<String, crate::resources::NativeResourceLease>,
+    pub(super) created_native: HashMap<String, Handle>,
+    pub(super) update_schema: Option<Arc<crate::PreparedValidator>>,
+    pub(super) work_class: Option<WorkClass>,
     pub(super) listeners: BTreeMap<u64, Arc<dyn SnapshotListener>>,
     pub(super) next_listener: u64,
     pub(super) cancellation_probe: Option<Arc<dyn CancellationProbe>>,
 }
 pub(super) struct Task {
+    pub(super) services: Arc<TaskServices>,
     pub(super) id: String,
     pub(super) scope: String,
     pub(super) data: Mutex<TaskData>,
@@ -19,11 +24,15 @@ pub(super) struct BatchParent {
     pub(super) context: TaskContext,
     pub(super) index: u32,
     pub(super) total: u32,
+    pub(super) forward_progress: bool,
 }
 
 /// Synchronous snapshot observer shared across desktop threads.
 /// Callbacks run outside the task lock and should return promptly; callbacks from
 /// concurrent mutations may overlap, and panics propagate to the publishing caller.
+/// Execution-guard destruction contains observer unwinds after settling ownership,
+/// allowing remaining cleanup deliveries to run. Panic hooks still run. Captured
+/// destructors and custom panic-payload destructors must not panic.
 pub trait SnapshotListener: Send + Sync + 'static {
     /// Receives an owned point-in-time snapshot, including one immediate delivery on subscribe.
     fn changed(&self, snapshot: TaskSnapshot);
@@ -51,7 +60,53 @@ pub struct Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         if let Some(task) = self.task.upgrade() {
-            lock(&task.data).listeners.remove(&self.id);
+            let removed = { lock(&task.data).listeners.remove(&self.id) };
+            // The listener's final capture can call back into this task from Drop.
+            drop(removed);
+        }
+    }
+}
+
+/// Captured atomically with the mutation; notification follows ownership cleanup.
+pub(super) struct Publication {
+    snapshot: TaskSnapshot,
+    listeners: Vec<Arc<dyn SnapshotListener>>,
+}
+impl TaskData {
+    pub(super) fn publication(&self) -> Publication {
+        Publication {
+            snapshot: self.snapshot.clone(),
+            listeners: self.listeners.values().cloned().collect(),
+        }
+    }
+}
+impl Publication {
+    pub(super) fn publish(self) -> TaskSnapshot {
+        for listener in self.listeners {
+            listener.changed(self.snapshot.clone());
+        }
+        self.snapshot
+    }
+    fn publish_unit(self) {
+        let Self {
+            snapshot,
+            mut listeners,
+        } = self;
+        if let Some(last) = listeners.pop() {
+            for listener in listeners {
+                listener.changed(snapshot.clone());
+            }
+            last.changed(snapshot);
+        }
+    }
+    pub(super) fn publish_cleanup(self) {
+        for listener in self.listeners {
+            // State and leases are settled before this boundary, even if an
+            // original executor panic is already unwinding. Arbitrary callback
+            // state is not reused by the framework after a caught observer panic.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                listener.changed(self.snapshot.clone());
+            }));
         }
     }
 }
@@ -69,22 +124,44 @@ impl TaskContext {
     pub fn snapshot(&self) -> TaskSnapshot {
         lock(&self.task.data).snapshot.clone()
     }
-    pub(super) fn change(
+    pub(super) fn prepare_change(
         &self,
         f: impl FnOnce(&mut TaskData) -> Result<()>,
-    ) -> Result<TaskSnapshot> {
-        let (snapshot, listeners) = {
-            let mut data = lock(&self.task.data);
-            f(&mut data)?;
-            (
-                data.snapshot.clone(),
-                data.listeners.values().cloned().collect::<Vec<_>>(),
-            )
-        };
-        for listener in listeners {
-            listener.changed(snapshot.clone());
+    ) -> Result<Publication> {
+        self.prepare_change_with(f, TaskData::publication)
+    }
+    pub(super) fn change_unit(&self, f: impl FnOnce(&mut TaskData) -> Result<()>) -> Result<()> {
+        let publication = self.prepare_change_with(f, |data| {
+            // Membership and the required owned snapshot are captured under the
+            // same mutex. A unit-returning mutation needs no discarded snapshot.
+            (!data.listeners.is_empty()).then(|| data.publication())
+        })?;
+        if let Some(publication) = publication {
+            publication.publish_unit();
         }
-        Ok(snapshot)
+        Ok(())
+    }
+    fn prepare_change_with<T>(
+        &self,
+        f: impl FnOnce(&mut TaskData) -> Result<()>,
+        capture: impl FnOnce(&TaskData) -> T,
+    ) -> Result<T> {
+        let publication = {
+            let mut data = lock(&self.task.data);
+            let was_terminal = data.snapshot.state.is_terminal();
+            let next_revision = data.snapshot.revision.get().checked_add(1).ok_or_else(|| {
+                Error::new(
+                    "task_revision_exhausted",
+                    "Task revision counter is exhausted",
+                )
+            })?;
+            f(&mut data)?;
+            if !was_terminal {
+                data.snapshot.revision = next_revision.into();
+            }
+            capture(&data)
+        };
+        Ok(publication)
     }
     /// Registers a listener and synchronously delivers the current snapshot before returning.
     /// Retain the returned guard to remain subscribed. Concurrent publication may
@@ -97,11 +174,12 @@ impl TaskContext {
             data.listeners.insert(id, listener.clone());
             (id, data.snapshot.clone())
         };
-        listener.changed(snapshot);
-        Subscription {
+        let subscription = Subscription {
             task: Arc::downgrade(&self.task),
             id,
-        }
+        };
+        listener.changed(snapshot);
+        subscription
     }
     pub(super) fn mutable(data: &TaskData) -> Result<()> {
         if data.snapshot.state.is_terminal() {
@@ -118,7 +196,7 @@ impl TaskContext {
     /// preserving the child's own work units; parent publication can also fail.
     pub fn progress(&self, progress: Progress) -> Result<()> {
         let message = progress.message.clone();
-        self.change(|data| {
+        self.change_unit(|data| {
             Self::mutable(data)?;
             if !data.started {
                 return Err(Error::new(
@@ -138,6 +216,9 @@ impl TaskContext {
             Ok(())
         })?;
         if let Some(parent) = &self.task.parent {
+            if !parent.forward_progress {
+                return Ok(());
+            }
             parent.context.progress(Progress {
                 completed: u64::from(parent.index).into(),
                 total: Some(u64::from(parent.total).into()),
@@ -151,7 +232,7 @@ impl TaskContext {
     /// and error. Does not update summary; streaming hosts should record counters
     /// with record_batch_outcome to avoid retaining item payloads.
     pub fn record_outcome(&self, outcome: Outcome) -> Result<()> {
-        self.change(|data| {
+        self.change_unit(|data| {
             Self::mutable(data)?;
             if !data.started {
                 return Err(Error::new(
@@ -180,13 +261,12 @@ impl TaskContext {
             data.snapshot.outcomes.sort_by_key(|o| o.index);
             Ok(())
         })
-        .map(|_| ())
     }
     /// Records one completed item without retaining its input, output, or error.
     /// Requires an active executor. Returns `batch_exhausted` without changing any
     /// counter if a u64 counter would overflow. Call once per item; indices are not tracked.
     pub fn record_batch_outcome(&self, success: bool) -> Result<()> {
-        self.change(|data| {
+        self.change_unit(|data| {
             Self::mutable(data)?;
             if !data.started {
                 return Err(Error::new(
@@ -210,7 +290,6 @@ impl TaskContext {
             summary.completed = completed.into();
             Ok(())
         })
-        .map(|_| ())
     }
     /// Captures a lease already authorized by a trusted host, including after owner release.
     /// The original handle must be a file in this task's scope. Returns `scope_mismatch`,
@@ -291,6 +370,22 @@ impl TaskContext {
     /// when index is not below total, or propagates cancellation/checkpoint errors.
     /// The host must begin and finish the child execution separately.
     pub fn batch_child(&self, index: u32, total: u32) -> Result<TaskContext> {
+        self.make_batch_child(index, total, true)
+    }
+
+    /// Creates a batch child whose progress remains local during overlapping execution.
+    /// Cancellation still follows the parent. The host reports completed-item progress
+    /// after consuming outcomes, so out-of-order children cannot decrease parent progress.
+    pub fn independent_batch_child(&self, index: u32, total: u32) -> Result<TaskContext> {
+        self.make_batch_child(index, total, false)
+    }
+
+    fn make_batch_child(
+        &self,
+        index: u32,
+        total: u32,
+        forward_progress: bool,
+    ) -> Result<TaskContext> {
         self.checkpoint()?;
         if index >= total {
             return Err(Error::new(
@@ -301,6 +396,8 @@ impl TaskContext {
         let id = format!("{}/{}", self.id(), index);
         let scope = self.scope().to_owned();
         let snapshot = TaskSnapshot {
+            revision: 0_u64.into(),
+            update: None,
             id: id.clone(),
             scope: scope.clone(),
             state: TaskState::Queued,
@@ -313,6 +410,7 @@ impl TaskContext {
         };
         Ok(TaskContext {
             task: Arc::new(Task {
+                services: self.task.services.clone(),
                 id,
                 scope,
                 resources: self.task.resources.clone(),
@@ -320,11 +418,16 @@ impl TaskContext {
                     context: self.clone(),
                     index,
                     total,
+                    forward_progress,
                 }),
                 data: Mutex::new(TaskData {
                     snapshot,
                     started: false,
                     leases: HashMap::new(),
+                    native_leases: HashMap::new(),
+                    created_native: HashMap::new(),
+                    update_schema: None,
+                    work_class: lock(&self.task.data).work_class,
                     listeners: BTreeMap::new(),
                     next_listener: 1,
                     cancellation_probe: None,

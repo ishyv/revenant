@@ -7,10 +7,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
-static NEXT_CANDIDATE: AtomicU64 = AtomicU64::new(1);
 struct Transaction {
     registry: OperationRegistry,
     candidate: Arc<dyn Provider>,
@@ -73,11 +72,7 @@ impl OperationRegistry {
         }
         // Own the candidate immediately so even invalid schema/dependency attempts
         // invoke its cleanup hook. Cleanup is synchronous to work on future Drop.
-        let scope = format!(
-            "provider-candidate-{}",
-            NEXT_CANDIDATE.fetch_add(1, Ordering::Relaxed)
-        );
-        self.resources.create_scope(&scope, None)?;
+        let scope = self.resources.create_scope(None)?;
         let mut transaction = Transaction {
             registry: self.clone(),
             candidate: candidate.clone(),
@@ -96,8 +91,12 @@ impl OperationRegistry {
         validate_json(&descriptor.configuration_schema, &config)?;
         let operations = candidate.operations()?;
         let mut ids = BTreeSet::new();
+        let mut preparations = BTreeMap::new();
         for operation in &operations {
-            validate_registration(operation)?;
+            preparations.insert(
+                operation.descriptor.id.clone(),
+                validate_registration(operation)?,
+            );
             if !ids.insert(operation.descriptor.id.clone()) {
                 return Err(Error::new(
                     "operation_conflict",
@@ -140,15 +139,12 @@ impl OperationRegistry {
                     || operations.iter().any(|operation| {
                         old_operations
                             .get(&operation.descriptor.id)
-                            .is_none_or(|old| {
-                                old.input != operation.descriptor.input
-                                    || old.output != operation.descriptor.output
-                            })
+                            .is_none_or(|old| **old != operation.descriptor)
                     })
                 {
                     return Err(Error::new(
                         "provider_contract_mismatch",
-                        "Replacement must preserve operation ids and input/output contracts",
+                        "Replacement must preserve every compiled operation descriptor field",
                     ));
                 }
             }
@@ -236,6 +232,7 @@ impl OperationRegistry {
                 data.operations.insert(
                     registration.descriptor.id.clone(),
                     RegisteredOperation {
+                        validators: preparations.remove(&registration.descriptor.id).unwrap(),
                         registration,
                         provider: Some(descriptor.id.clone()),
                     },

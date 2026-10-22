@@ -1,10 +1,15 @@
 # Client API reference
 
-The generated `$lib/revenant` facade is the application authoring entry. Its
+The generated `#lib/revenant.ts` facade is the application authoring entry. Its
 operation inputs, outputs, schemas, descriptions and Rust source locations come
 from the compiled manifest. Client classes project native ownership and do not
 redeclare built-in Rust DTOs or supply execution callbacks. Every public source
 declaration has JSDoc, including constructors and DTO fields.
+
+`useOperations()` from the generated facade returns callable functions. Calling
+`api.titles.normalize({text})` awaits and disposes its task; `.run({text})` retains
+the task for progress/cancellation/results. `.query()` is generated only for
+declared `read_only` operations. The function owns the component scope underneath.
 
 ## Root and scopes
 
@@ -20,6 +25,8 @@ declaration has JSDoc, including constructors and DTO fields.
 | `App.dispose()`, `disposeAsync()` | Begin teardown synchronously, or await resource and native scope cleanup. |
 | `App.cleanupErrors` | Observe classified resource and native teardown failures. |
 | `confirm(message)` | Await a native Yes/No dialog. Only Yes returns `true`; cancellation returns `false`, and a dialog failure rejects. Generated hosts permit message dialogs for their main window. |
+| `askSaveChanges(message, labels?)` | Native Save / Discard / Cancel decision. Dialog dismissal means Cancel; dialog failures reject. |
+| `onDesktopCloseRequested(decide, {canClose?, onError?})` | Serialize repeated native close requests. Keep the window on refusal or failure; synchronously recheck pending edits before destruction. Returns an unsubscribe function. Native host shutdown remains authoritative. |
 | `Scope.ready`, `id`, `parent`, `transport`, `disposed` | Advanced native ownership state; read `id` after readiness. |
 | `Scope.assert()`, `own(resource)`, `release(resource)` | Check local lifetime, register idempotent cleanup, or forget a released resource. |
 | `Scope.child()`, `request(request, updates?)` | Create an owned native child or dispatch a scoped capability after startup. Updates are direct snapshots. |
@@ -45,6 +52,7 @@ a projection does not independently authorize a folder path or resource handle.
 | `FileCollection.owner`, `id`, `assert()` | View owner, native identity after readiness and lifetime check. |
 | `FileCollection.window(offset, limit=128)` | Serialize bounded viewport requests, coalesce superseded calls, and drain known ACK publications before admission. Limits are 1..512. |
 | `FileCollection.query(options)`, `filter(search)`, `sort(key, descending?)` | Replace the native view and advance the client query generation. Filter/sort preserve the other current options. Query changes clear explicit selections. |
+| `FileCollection.refresh({signal}?)` | Rescan this collection, preserve search/sort/recursion, reset its viewport and selections, and resolve after discovery completes. Abort, disposal and superseding refresh reject with classified errors. Other collections retain their inventory. |
 | `FileCollection.selection()` | Own an explicit native selection of at most 512 files. |
 | `FileCollection.allMatching()` | Capture this query generation without enumerating its matches in JavaScript. |
 | `FileCollection.selector(generation)` | Advanced selector resolution; returns `{view, allMatching:true, generation}` or rejects a changed query. |
@@ -65,6 +73,12 @@ another coalesced Channel page. Native code owns at most two windows per view
 until ACK. An initial short page grows through native scan refreshes; the client
 does not mistake its current item count for the complete dataset. See
 [WIRE.md](WIRE.md) for publication and viewport admission ordering.
+
+Filtering and sorting during refresh use the new inventory. Cancellation rejects
+with `refresh_cancelled`, supersession with `refresh_superseded`, and disposal
+with `view_disposed`. A cancelled inventory remains partial and cannot admit an
+all-matching batch; call `refresh()` again to recover. A batch already admitted
+keeps its captured inventory or explicit resource leases through refresh.
 
 ## Operations, tasks and results
 
@@ -177,3 +191,39 @@ HyvUI or install a theme. Client source checks are `npm run check` and
 is `node scripts/check-api-docs.mjs`. `npm test` exercises native fake-transport
 workflows, while `npm run check` also checks native provider and operation typing.
 Actual Tauri bridge and large-index acceptance remain separate from this suite.
+## Scoped query groups and covering dialogs
+
+`queryGroup(scope, { required: { summary: api.summary }, optional: { chart: api.chart } })`
+composes generated declared-read callables bound to that scope. Call
+`group.load(requestKey, { summary: summaryInput, chart: chartInput })` explicitly.
+Its Svelte-readable snapshot publishes all settled slots together. `requestKey`
+identifies the newest request; `dataKey` identifies the complete retained result.
+A required failure retains the prior complete group. An optional failure appears
+in `errors.chart` and omits the current `data.chart`; older optional results are
+never merged into a newer group. This does not create a database transaction.
+
+Groups admit at most sixteen distinct slots, one active load and one replaceable
+pending load. Frozen load inputs are limited to one MiB of encoded JSON. A storm
+disposes superseded child queries and waits for their native cleanup before
+admitting the latest pending load. Disposal freezes publication and settles
+pending callers after admitted ownership has been reclaimed. Generated reads
+expose `owner` and `forScope(scope)` for explicit rebinding; mutations have no
+group helper.
+
+Create `const overlays = new OverlayCoordinator(scope)` and pass it to related
+`<NativeCanvas overlays={overlays} ... />` and
+`<CoveredModal overlays={overlays} open={showDialog} ... />` components. The modal
+uses ordinary HyvUI presentation. It mounts after native hide acknowledgements
+and removes its content before restoration. Canvas registrations must use the
+coordinator scope or its descendants. Overlapping covers restore only after the
+last cover closes, and manual suspension, document visibility and current
+geometry still determine whether a surviving canvas is eligible to show.
+
+For a native picker or another ordinary dialog, await `overlays.cover()` and
+release its returned token with `await cover.close(async () => { ... })`; the
+callback must acknowledge content removal. If content removal fails, coverage
+remains active and the callback can be retried. Hide/restore failures reject and
+remain observable through the coordinator's last 64 `errors`. Late registration
+has an awaited `ready` barrier; teardown removes eligibility immediately. Owner
+teardown removes adapted modal content and never restores surfaces. Canvas
+`suspend()` and `restore()` both return native placement acknowledgements.

@@ -37,15 +37,27 @@ export class Signal<T> implements Readable<T> {
   /** Queue publications so nested writes preserve observable ordering. */
   set(value: T): void {
     this.value = value;
-    for (const subscriber of this.subscribers) {
-      subscriber.invalidate?.();
+    const subscribers = [...this.subscribers];
+    // Reserve the entire publication before invalidators can enqueue nested writes.
+    for (const subscriber of subscribers) {
       queue.push(() => {
         if (this.subscribers.has(subscriber)) subscriber.run(value);
       });
     }
-    if (flushing) return;
+    const shouldFlush = !flushing;
     flushing = true;
     try {
+      for (const subscriber of subscribers) {
+        if (!this.subscribers.has(subscriber)) continue;
+        try {
+          subscriber.invalidate?.();
+        } catch (error) {
+          queueMicrotask(() => {
+            throw error;
+          });
+        }
+      }
+      if (!shouldFlush) return;
       while (queue.length) {
         try {
           queue.shift()!();
@@ -56,7 +68,7 @@ export class Signal<T> implements Readable<T> {
         }
       }
     } finally {
-      flushing = false;
+      if (shouldFlush) flushing = false;
     }
   }
   /** Detach all consumers when the owning projection closes. */

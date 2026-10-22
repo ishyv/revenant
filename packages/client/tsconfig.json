@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "src/**/*.svelte", "tests/provider-typing.ts"]
+  "include": ["src/**/*.ts", "src/**/*.svelte", "tests/provider-typing.ts", "tests/query-group-typing.ts"]
 }

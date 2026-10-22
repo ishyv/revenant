@@ -5,9 +5,9 @@ use revenant::TaskContext;
 
 fn running() -> (TaskContext, revenant::TaskExecution) {
     let resources = revenant::ResourceRegistry::new();
-    resources.create_scope("test", None).unwrap();
+    let scope = resources.create_scope(None).unwrap();
     let context = revenant::TaskManager::new(resources)
-        .create("test", "work")
+        .create(&scope, "work")
         .unwrap();
     let execution = context.begin().unwrap();
     (context, execution)
@@ -48,6 +48,77 @@ fn request(search: &str) -> QueryInput {
         annotated_only: false,
         offset: 0,
         limit: 60,
+    }
+}
+
+#[test]
+fn annotated_catalog_contracts_preserve_wire_shapes_and_declare_agent_effects() {
+    let manifest = crate::app().manifest().unwrap();
+    assert_eq!((manifest.version, manifest.protocol), (5, 4));
+    for (id, arguments, sample, effect, independent) in [
+        (
+            "images.bootstrap",
+            vec![],
+            revenant::serde_json::json!({}),
+            revenant::OperationEffect::ReadOnly,
+            true,
+        ),
+        (
+            "images.scan",
+            vec!["path"],
+            revenant::serde_json::json!({"path":"/photos"}),
+            revenant::OperationEffect::Write,
+            false,
+        ),
+        (
+            "images.query",
+            vec!["search", "rootId", "annotatedOnly", "offset", "limit"],
+            revenant::serde_json::json!({"search":"sunset", "rootId":"", "annotatedOnly":false, "offset":0, "limit":48}),
+            revenant::OperationEffect::ReadOnly,
+            true,
+        ),
+        (
+            "images.annotate",
+            vec!["id", "note"],
+            revenant::serde_json::json!({"id":"asset", "note":"A sunset"}),
+            revenant::OperationEffect::Write,
+            false,
+        ),
+        (
+            "images.render",
+            vec!["id", "large"],
+            revenant::serde_json::json!({"id":"asset", "large":false}),
+            revenant::OperationEffect::Write,
+            true,
+        ),
+        (
+            "images.removeRoot",
+            vec!["id"],
+            revenant::serde_json::json!({"id":"root"}),
+            revenant::OperationEffect::Write,
+            false,
+        ),
+        (
+            "images.cacheUsage",
+            vec![],
+            revenant::serde_json::json!({}),
+            revenant::OperationEffect::Write,
+            false,
+        ),
+        (
+            "images.clearCache",
+            vec![],
+            revenant::serde_json::json!({}),
+            revenant::OperationEffect::Write,
+            false,
+        ),
+    ] {
+        let operation = manifest.operations.iter().find(|op| op.id == id).unwrap();
+        assert_eq!(operation.arguments, arguments, "{id}");
+        assert_eq!(operation.effect, effect, "{id}");
+        assert_eq!(operation.independent, independent, "{id}");
+        assert!(operation.agent, "{id}");
+        revenant::validate_json(&operation.input.schema, &sample).unwrap();
     }
 }
 #[test]
@@ -193,6 +264,25 @@ fn real_folder_refresh_keeps_notes_and_renders_large_originals() {
 #[test]
 fn operation_ids_and_wire_shapes_are_preserved() {
     let manifest = crate::app().manifest().unwrap();
+    let render = manifest
+        .operations
+        .iter()
+        .find(|operation| operation.id == "images.render")
+        .unwrap();
+    for warning in [None, Some("Unmanaged files prevent caching".to_owned())] {
+        let value = revenant::serde_json::to_value(crate::contracts::Rendition {
+            data_url: "data:image/jpeg;base64,ok".into(),
+            width: 1,
+            height: 1,
+            cache_warning: warning.clone(),
+        })
+        .unwrap();
+        revenant::validate_json(&render.output.schema, &value).unwrap();
+        assert_eq!(
+            value.get("cacheWarning").and_then(|value| value.as_str()),
+            warning.as_deref()
+        );
+    }
     let images: Vec<_> = manifest
         .operations
         .iter()
@@ -206,6 +296,8 @@ fn operation_ids_and_wire_shapes_are_preserved() {
         [
             "images.annotate",
             "images.bootstrap",
+            "images.cacheUsage",
+            "images.clearCache",
             "images.query",
             "images.removeRoot",
             "images.render",
@@ -341,7 +433,13 @@ fn invalid_and_oversized_cached_renditions_keep_the_cache_error_code() {
     rendition::render(&catalog, &input, &context).unwrap();
     let cached = fs::read_dir(catalog.directory().join("renditions"))
         .unwrap()
-        .next()
+        .find(|file| {
+            file.as_ref().is_ok_and(|file| {
+                file.path()
+                    .extension()
+                    .is_some_and(|extension| extension == "jpg")
+            })
+        })
         .unwrap()
         .unwrap()
         .path();
@@ -360,6 +458,38 @@ fn invalid_and_oversized_cached_renditions_keep_the_cache_error_code() {
             .unwrap()
             .code,
         "cache_invalid"
+    );
+}
+
+#[test]
+fn clearing_regenerates_renditions_without_touching_notes_or_originals() {
+    let (_directory, catalog, asset, original) =
+        image_fixture(&image::DynamicImage::new_rgb8(20, 10));
+    catalog
+        .annotate(NoteInput {
+            id: asset.id.clone(),
+            note: "Keep this annotation".into(),
+        })
+        .unwrap();
+    let original_bytes = fs::read(&original).unwrap();
+    let input = RenderInput {
+        id: asset.id,
+        large: false,
+    };
+    let (context, _execution) = running();
+    let before = rendition::render(&catalog, &input, &context).unwrap();
+    let cache = crate::cache::Cache::open(catalog.directory(), &context).unwrap();
+    assert!(cache.usage(&context).unwrap().managed_bytes.get() > 0);
+    let (_, entries, usage) = cache.clear(&context).unwrap();
+    assert_eq!(entries, 1);
+    assert_eq!(usage.bytes.get(), 0);
+    drop(cache);
+    let after = rendition::render(&catalog, &input, &context).unwrap();
+    assert_eq!(before.data_url, after.data_url);
+    assert_eq!(fs::read(original).unwrap(), original_bytes);
+    assert_eq!(
+        catalog.query(request("annotation")).unwrap().items[0].note,
+        "Keep this annotation"
     );
 }
 

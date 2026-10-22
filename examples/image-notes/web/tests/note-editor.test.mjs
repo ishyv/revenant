@@ -45,11 +45,12 @@ test("failed or late confirmations never run destructive actions", async () => {
 test("navigation waits for edits made while the first note save is pending", async () => {
   const pending = [];
   const committed = [];
-  const editor = noteEditor({
-    call(input) {
+  const editor = noteEditor(
+    (input) => {
       return new Promise((resolve) => pending.push({ input, resolve }));
     },
-  }, (saved) => committed.push(saved));
+    (saved) => committed.push(saved),
+  );
   const navigation = coordinator(editor);
   editor.select(asset("first"));
   editor.edit("first draft");
@@ -75,12 +76,12 @@ test("navigation waits for edits made while the first note save is pending", asy
 
 test("failed saves block navigation and refresh and retain the draft for retry", async () => {
   let fail = true;
-  const editor = noteEditor({
-    async call(input) {
+  const editor = noteEditor(
+    async (input) => {
       if (fail) throw new Error("disk full");
       return input;
     },
-  });
+  );
   const navigation = coordinator(editor);
   editor.select(asset("first"));
   editor.edit("keep this");
@@ -105,7 +106,7 @@ test("failed saves block navigation and refresh and retain the draft for retry",
 test("disposing a note editor suppresses a late save and queued navigation", async () => {
   let resolve;
   let updates = 0;
-  const editor = noteEditor({ call: () => new Promise((done) => { resolve = done; }) }, () => updates++);
+  const editor = noteEditor(() => new Promise((done) => { resolve = done; }), () => updates++);
   const navigation = coordinator(editor);
   editor.select(asset("first"));
   editor.edit("draft");

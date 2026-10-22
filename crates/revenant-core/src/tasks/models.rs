@@ -81,6 +81,9 @@ pub struct BatchSummary {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSnapshot {
+    /// Monotonic task mutation revision; stale delivery must not replace newer state.
+    #[serde(default)]
+    pub revision: DecimalU64,
     /// Task identifier unique among the manager entries currently retained.
     pub id: String,
     /// Owning task scope used for resource admission and cancellation checkpoints.
@@ -94,6 +97,10 @@ pub struct TaskSnapshot {
     /// Constant-size item totals, initialized to zero for a newly queued task.
     #[serde(default)]
     pub summary: BatchSummary,
+    /// Newest bounded application update, distinct from progress and terminal result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub update: Option<TaskUpdate>,
     /// Executor return value after successful return, including partial batch completion.
     /// Explicit finish_batch also retains its descriptor after acknowledged cancellation;
     /// ordinary finish with an error leaves this absent. Streaming hosts keep it bounded.
@@ -106,4 +113,14 @@ pub struct TaskSnapshot {
     pub error: Option<Error>,
     /// Whether cancellation has been requested; running executors must checkpoint to acknowledge it.
     pub cancel_requested: bool,
+}
+
+/// The latest application snapshot emitted by an operation with a declared update contract.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskUpdate {
+    /// Task revision at publication; intermediate updates are replaceable snapshots.
+    pub revision: DecimalU64,
+    /// Schema-checked JSON data limited to MAX_TASK_UPDATE_BYTES encoded bytes.
+    pub value: Value,
 }

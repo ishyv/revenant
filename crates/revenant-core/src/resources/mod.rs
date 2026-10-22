@@ -9,10 +9,12 @@ use std::{
 };
 
 mod lease;
+mod native;
 mod registry;
 mod scopes;
-use lease::Resource;
+use lease::FileResource;
 pub use lease::ResourceLease;
+pub use native::{FolderHandle, NativeFolder, NativeLease, NativeResourceLease, Resource};
 use registry::Resources;
 pub use registry::{ChunkReader, ResourceCleanup, ResourcePort, ResourceRegistry};
 use scopes::Scope;

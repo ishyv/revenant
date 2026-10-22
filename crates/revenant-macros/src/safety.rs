@@ -26,6 +26,19 @@ pub(crate) fn validate(input: &DeriveInput) -> syn::Result<()> {
     }
     let mut attributes: Vec<_> = input.attrs.iter().collect();
     for field in fields(&input.data)? {
+        for attribute in &field.attrs {
+            if field.ident.is_none() && attribute.path().is_ident("serde") {
+                attribute.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("skip_serializing_if") {
+                        return Err(meta.error("positional contract fields cannot omit elements"));
+                    }
+                    if meta.input.peek(syn::Token![=]) {
+                        let _: syn::Expr = meta.value()?.parse()?;
+                    }
+                    Ok(())
+                })?;
+            }
+        }
         attributes.extend(&field.attrs);
     }
     if let Data::Enum(e) = &input.data {
@@ -84,6 +97,7 @@ pub(crate) fn validate(input: &DeriveInput) -> syn::Result<()> {
 }
 pub(crate) fn safe_impl(input: &DeriveInput, root: &Tokens) -> syn::Result<Tokens> {
     let name = &input.ident;
+    let own_name = name.to_string();
     let mut generics = input.generics.clone();
     for param in generics.type_params_mut() {
         param.bounds.push(parse_quote!(#root::Contract));
@@ -94,7 +108,7 @@ pub(crate) fn safe_impl(input: &DeriveInput, root: &Tokens) -> syn::Result<Token
         // Recursive fields are additionally audited by the complete generated schema.
         if !text
             .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|part| part == name.to_string() || part == "Self")
+            .any(|part| part == own_name || part == "Self")
         {
             generics
                 .make_where_clause()
@@ -149,6 +163,43 @@ fn handle_visitor(data: &Data, name: &syn::Ident, root: &Tokens) -> Tokens {
         Data::Union(_) => unreachable!(),
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positional_omission_is_rejected_but_named_omission_is_supported() {
+        for input in [
+            parse_quote!(
+                struct Pair(
+                    #[serde(skip_serializing_if = "Option::is_none")] Option<String>,
+                    u32,
+                );
+            ),
+            parse_quote!(
+                enum Choice {
+                    Pair(
+                        #[serde(skip_serializing_if = "Option::is_none")] Option<String>,
+                        u32,
+                    ),
+                }
+            ),
+        ] {
+            assert!(
+                validate(&input).is_err(),
+                "positional omission shifts tuple elements"
+            );
+        }
+        let input = parse_quote!(
+            struct Record {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                value: Option<String>,
+            }
+        );
+        validate(&input).unwrap();
+    }
+}
+
 pub(crate) fn optional_fields(data: &mut Data, add: bool) {
     let mark = |fields: &mut Fields| {
         for field in fields {
@@ -158,7 +209,12 @@ pub(crate) fn optional_fields(data: &mut Data, add: bool) {
                     .retain(|attribute| !attribute.path().is_ident("ts"));
                 continue;
             }
-            let omitted = field
+            // Omission is an object-field policy. Removing an unnamed element
+            // shifts later tuple positions and disagrees with its fixed schema.
+            if field.ident.is_none() {
+                continue;
+            }
+            let mut omitted = field
                 .attrs
                 .iter()
                 .filter(|attribute| attribute.path().is_ident("serde"))
@@ -175,6 +231,38 @@ pub(crate) fn optional_fields(data: &mut Data, add: bool) {
                     });
                     omitted
                 });
+            let is_option = matches!(&field.ty, syn::Type::Path(path)
+                if path.qself.is_none() && path.path.segments.last().is_some_and(|segment| segment.ident == "Option"));
+            if is_option && !omitted {
+                // Option fields share the same omission contract as operation
+                // arguments. Keep generated Serde, schema, and TS in agreement.
+                field
+                    .attrs
+                    .push(parse_quote!(#[serde(skip_serializing_if = "Option::is_none")]));
+                omitted = true;
+            }
+            if is_option {
+                let has_default = field
+                    .attrs
+                    .iter()
+                    .filter(|attribute| attribute.path().is_ident("serde"))
+                    .any(|attribute| {
+                        let mut found = false;
+                        let _ = attribute.parse_nested_meta(|meta| {
+                            if meta.path.is_ident("default") {
+                                found = true;
+                            }
+                            if meta.input.peek(syn::Token![=]) {
+                                let _: syn::Expr = meta.value()?.parse()?;
+                            }
+                            Ok(())
+                        });
+                        found
+                    });
+                if !has_default {
+                    field.attrs.push(parse_quote!(#[serde(default)]));
+                }
+            }
             if omitted {
                 field.attrs.push(parse_quote!(#[ts(optional)]));
             }

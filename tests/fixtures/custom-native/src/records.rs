@@ -1,4 +1,4 @@
-use revenant::{Result, TaskContext, contract, operation};
+use revenant::{contract, operation};
 
 /// A documented record crossing the native application boundary.
 #[contract]
@@ -10,11 +10,10 @@ pub struct Record {
 }
 
 /// Normalize a title for the portable CLI proof.
-#[operation(id = "records.normalize")]
-pub async fn normalize(input: Record, context: TaskContext) -> Result<Record> {
-    context.checkpoint()?;
-    Ok(Record {
-        title: input.title.trim().to_uppercase(),
-        ..input
-    })
+#[operation(id = "records.normalize", read_only, independent)]
+pub fn normalize(record: Record) -> Record {
+    Record {
+        title: record.title.trim().to_uppercase(),
+        ..record
+    }
 }

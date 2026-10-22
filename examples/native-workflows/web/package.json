@@ -1,0 +1,8 @@
+{
+  "name": "native-workflows", "version": "0.4.0", "private": true, "type": "module",
+  "engines": { "node": ">=24 <25" }, "imports": { "#lib/*": "./src/lib/*" },
+  "scripts": { "dev": "vite dev", "build": "vite build", "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json", "tauri": "tauri" },
+  "dependencies": { "@hyvnt/hyvui": "file:../.revenant/sdk/vendor/hyvui-1.0.0.tgz", "@revenant/client": "file:../.revenant/sdk/packages/client" },
+  "overrides": { "svelte-language-server": { "svelte": "$svelte" } },
+  "devDependencies": { "@sveltejs/adapter-static": "4.0.0", "@sveltejs/kit": "3.0.1", "@sveltejs/vite-plugin-svelte": "7.3.1", "@tauri-apps/cli": "^2.0.0", "svelte": "5.57.2", "svelte-check": "4.7.6", "svelte-language-server": "0.18.4", "typescript": "6.0.3", "vite": "8.3.3" }
+}

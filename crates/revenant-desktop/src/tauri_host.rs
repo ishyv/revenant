@@ -46,11 +46,16 @@ pub fn launch(
             };
             let runtime = runtime.inner().clone();
             let label = webview.window().label().to_owned();
+            #[cfg(all(feature = "native-surfaces", windows))]
+            crate::native_surfaces::dispose_window(&label);
             // Capture old roots at navigation start, before the new page can
             // connect. A queued cleanup must never discover and retire its roots.
             let roots: Vec<_> = crate::runtime::lock(&runtime.inner.scopes)
                 .iter()
-                .filter(|(_, scope)| scope.window == label && scope.parent.is_none())
+                .filter(|(_, scope)| {
+                    scope.owner == crate::runtime::scopes::ScopeOwner::Window(label.clone())
+                        && scope.parent.is_none()
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             if !roots.is_empty() {
@@ -105,6 +110,9 @@ pub fn launch(
                 .await
                 .map_err(host_error)?
             })?;
+            if let Some(bridge) = tauri::async_runtime::block_on(runtime.start_agent_bridge())? {
+                app.manage(BridgeState(std::sync::Mutex::new(Some(bridge))));
+            }
             if !app.manage(runtime) {
                 return Err(Error::new(
                     "native_runtime_exists",
@@ -120,11 +128,21 @@ pub fn launch(
     let mut shutdown_started = false;
     let exit_ready = Arc::new(AtomicBool::new(false));
     app.run(move |app, event| match event {
+        #[cfg(all(feature = "native-surfaces", windows))]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. },
+            ..
+        } => {
+            crate::native_surfaces::wake_window(&label);
+        }
         RunEvent::WindowEvent {
             label,
             event: WindowEvent::Destroyed,
             ..
         } => {
+            #[cfg(all(feature = "native-surfaces", windows))]
+            crate::native_surfaces::dispose_window(&label);
             if let Some(runtime) = app.try_state::<DesktopRuntime>() {
                 let runtime = runtime.inner().clone();
                 tauri::async_runtime::spawn(cleanup_window(runtime, label, None));
@@ -132,6 +150,12 @@ pub fn launch(
         }
         RunEvent::ExitRequested { api, code, .. } if !exit_ready.load(Ordering::Acquire) => {
             api.prevent_exit();
+            #[cfg(all(feature = "native-surfaces", windows))]
+            {
+                for window in app.webview_windows().values() {
+                    crate::native_surfaces::dispose_window(window.label());
+                }
+            }
             // Repeated close requests cannot bypass the single shutdown pass.
             // The exit requested by that pass is allowed through after cleanup.
             if !shutdown_started {
@@ -141,19 +165,41 @@ pub fn launch(
                     .try_state::<DesktopRuntime>()
                     .map(|state| state.inner().clone());
                 let exit_ready = exit_ready.clone();
+                let mut bridge = app
+                    .try_state::<BridgeState>()
+                    .and_then(|state| state.0.lock().ok()?.take());
+                if let Some(bridge) = bridge.as_mut() {
+                    bridge.request_stop();
+                }
                 tauri::async_runtime::spawn(async move {
-                    if let Some(runtime) = runtime {
-                        let shutdown = tauri::async_runtime::spawn_blocking(move || {
-                            tauri::async_runtime::block_on(runtime.shutdown())
-                        });
-                        // The watchdog is independent of blocking flush/provider
-                        // work: an uncooperative worker cannot extend this deadline.
-                        match tokio::time::timeout(SHUTDOWN_LIMIT, shutdown).await {
-                            Ok(Ok(Ok(()))) => {}
-                            Ok(Ok(Err(error))) => eprintln!("Revenant shutdown: {error}"),
-                            Ok(Err(error)) => eprintln!("Revenant shutdown worker: {error}"),
-                            Err(_) => eprintln!("Revenant shutdown exceeded its ten-second grace"),
+                    let native_cleanup = async move {
+                        if let Some(runtime) = runtime {
+                            let shutdown = tauri::async_runtime::spawn_blocking(move || {
+                                tauri::async_runtime::block_on(runtime.shutdown())
+                            });
+                            // The watchdog is independent of blocking flush/provider
+                            // work: an uncooperative worker cannot extend this deadline.
+                            match shutdown.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => eprintln!("Revenant shutdown: {error}"),
+                                Err(error) => eprintln!("Revenant shutdown worker: {error}"),
+                            }
                         }
+                    };
+                    let bridge_cleanup = async move {
+                        if let Some(bridge) = bridge
+                            && let Err(error) = bridge.stop().await
+                        {
+                            eprintln!("Revenant bridge cleanup: {error}");
+                        }
+                    };
+                    if tokio::time::timeout(SHUTDOWN_LIMIT, async {
+                        tokio::join!(native_cleanup, bridge_cleanup);
+                    })
+                    .await
+                    .is_err()
+                    {
+                        eprintln!("Revenant shutdown exceeded its ten-second grace");
                     }
                     exit_ready.store(true, Ordering::Release);
                     app.exit(code.unwrap_or(0));
@@ -164,6 +210,8 @@ pub fn launch(
     });
     Ok(())
 }
+
+struct BridgeState(std::sync::Mutex<Option<revenant_agent::BridgeServer>>);
 
 async fn cleanup_window(runtime: DesktopRuntime, label: String, roots: Option<Vec<String>>) {
     loop {
@@ -203,6 +251,62 @@ async fn revenant_dispatch(
     request: Value,
     updates: Option<JavaScriptChannelId>,
 ) -> Result<Value> {
+    let action = request.get("action").and_then(Value::as_str).unwrap_or("");
+    if action.starts_with("surface.") {
+        #[cfg(all(feature = "native-surfaces", windows))]
+        {
+            let sink = updates.map(|id| {
+                let channel: Channel<Value> = id.channel_on(window.as_ref().clone());
+                Arc::new(move |event| {
+                    let _ = channel.send(event);
+                }) as UpdateSink
+            });
+            return crate::native_surfaces::dispatch(
+                window,
+                runtime.inner().clone(),
+                request,
+                sink,
+            )
+            .await;
+        }
+        #[cfg(not(all(feature = "native-surfaces", windows)))]
+        return Err(Error::new(
+            "native_surfaces_unavailable",
+            "This host has no native viewport backend",
+        ));
+    }
+    #[cfg(all(feature = "native-surfaces", windows))]
+    if action == "scope.dispose" {
+        let scope = request
+            .get("scope")
+            .and_then(Value::as_str)
+            .ok_or_else(|| host_error("Missing scope"))?
+            .to_owned();
+        runtime.validate_window(&scope, window.label())?;
+        let owned_runtime = runtime.inner().clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        window
+            .run_on_main_thread(move || {
+                let mut ids = vec![scope];
+                {
+                    let scopes = crate::runtime::lock(&owned_runtime.inner.scopes);
+                    let mut index = 0;
+                    while index < ids.len() {
+                        let children: Vec<_> = scopes
+                            .iter()
+                            .filter(|(_, s)| s.parent.as_deref() == Some(ids[index].as_str()))
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        ids.extend(children);
+                        index += 1;
+                    }
+                }
+                crate::native_surfaces::dispose_scopes(&ids);
+                let _ = tx.send(());
+            })
+            .map_err(host_error)?;
+        rx.await.map_err(host_error)?;
+    }
     if request.get("action").and_then(Value::as_str) == Some("folder.open") {
         if serde_json::to_vec(&request)?.len() > runtime.inner.options.max_contract_bytes {
             return Err(Error::new(
@@ -273,12 +377,12 @@ fn preview_response(
     // their webview and the random token remains their read capability.
     let url = webview.url().map_err(host_error)?;
     let mut origin = url.origin().ascii_serialization();
-    if origin == "null" {
-        if let Some(host) = url.host_str() {
-            origin = format!("{}://{host}", url.scheme());
-            if let Some(port) = url.port() {
-                origin.push_str(&format!(":{port}"));
-            }
+    if origin == "null"
+        && let Some(host) = url.host_str()
+    {
+        origin = format!("{}://{host}", url.scheme());
+        if let Some(port) = url.port() {
+            origin.push_str(&format!(":{port}"));
         }
     }
     let origin = HeaderValue::from_str(&origin)
@@ -287,7 +391,7 @@ fn preview_response(
         .headers()
         .get_all(header::ORIGIN)
         .iter()
-        .any(|value| value != &origin)
+        .any(|value| value != origin)
     {
         return Err(Error::new(
             "scope_mismatch",

@@ -1,152 +1,95 @@
-# Desktop 0.3 validation status
+# Revenant validation status
 
-Validation performed on Windows on October 2, 2026. Beads `revenant-gl5` tracks
-the migration; `revenant-gl5.7` remains open for the release limitations below.
-Formal tests began after the native/client/tooling workflow compiled together.
+## Work-in-progress checkpoint — October 22, 2026
 
-## Evidence boundaries
+This checkpoint preserves the unpublished Revenant 0.4 work for cloud
+continuation. It is **not release approval**. It was developed on `main` over
+base `564e4142c8c4d1b57f2473f7a09d05d16da2a0d4`; old working-tree measurements
+do not automatically validate this checkpoint. Project layout version 3,
+compiled manifest version 6, bridge protocol version 5, and SDK/client
+compatibility revision 4 are distinct contracts.
 
-| Check | Current evidence/state |
+## Fresh Windows checkpoint checks
+
+| Check | October 22 result |
 | --- | --- |
-| Public Rust documentation | Core, SDK, macros and desktop strict Rustdoc pass, including broken links and invalid HTML tags |
-| TypeScript API documentation | 476 public declarations across three exports pass |
-| Windows compile/docs/frontend CI | Workflow configured; remote result pending |
-| Formal Rust/client tests | 65 Rust tests including one doctest pass; native tests include Windows concurrent-reader persistence and uncooperative shutdown. Client: 20 tests pass. Two environment-dependent tests are ignored by the ordinary suite and were run separately |
-| 500,000-file folder/query/selection/results | Real native fixture passes; bounded native and installed UI evidence below |
-| Zed / rust-analyzer discovery | Actual Zed project discovery, rust-analyzer hover/definition and macro expansion pass; generated TypeScript consumer hover/source link passes |
-| Packaged Windows app | Both NSIS bundles built. File/media installed and launched; embedded assets reload offline with Node/Cargo absent from child PATH |
-| Native window close/rebuild/cancellation | Fresh scaffold launches; CLI stops owned descendants. Installed UI cancellation retains partial paged results; route disposal reports zero resources/jobs |
+| Client TypeScript and Svelte | Passed |
+| Public client documentation | Passed |
+| Ordinary client tests | 96 passed |
+| Mounted UI tests | 3 passed |
+| Python benchmark correctness/ownership tests | 112 passed |
+| Rust formatting and locked all-feature workspace tests (including doctests) | Passed |
+| Node tooling tests | 33 passed; rust-analyzer case skipped |
+| Exact-checkpoint remote CI | Pending publication/execution |
 
-API documentation checking is separate from typechecking and does not prove IPC,
-performance, packaging or runtime correctness. Its diagnostics include source
-paths/lines for public declarations, interface members, methods/properties,
-constructors, type members, subscriptions and exported Svelte components.
-It follows package exports/reexports and named local types, skips private/protected
-members and generic type parameters, and rejects missing/placeholder descriptions.
+These checks do not establish performance, installed-app acceptance, or
+cross-platform support. Ignored/hardware tests are separate gates.
 
-## Development documentation gate
+## Known limitations carried into continuation
 
-With the existing client dependencies installed:
+The prepublication audit `revenant-c8p` remains open in the local Beads tracker.
+The following concerns are not represented as fixed by this checkpoint:
 
-```powershell
-node scripts/check-api-docs.mjs
-```
+- MCP async-writer interruption has regressions, but native process exit with a
+  blocked Tokio stdout worker remains unverified. EOF during blocked SDK
+  initialization/error replies also needs independent validation.
+- Native-surface lifecycle/queue bounds, canvas prop changes, showcase ownership,
+  and graphics behavior have source-review concerns requiring focused reproduction.
+- Folder path identity under concurrent namespace mutation needs investigation;
+  a selected path is not itself an immutable directory identity.
+- Windows installed workflows, clean-machine WebView2 provisioning, CSP negative
+  tests, active-work shutdown, and visual editor behavior require evidence tied
+  to final source/artifact identity. Historical local results are insufficient.
+- Linux/macOS smoke workflow configuration is not proof of execution. A Linux
+  cloud host cannot establish Windows GPU or WebView2 acceptance.
+- Restricted compute is experimental; no automatic application speedup is claimed.
+- The existing HyvUI archive has font notices but no verified top-level software
+  license grant. No new third-party redistribution-rights claim is made.
 
-For Rust, coordinate the Cargo slot with the active owners before compiling.
-The final/CI documentation command denies missing docs and broken intra-doc links
-for core, SDK, macros and desktop. A source-level deny attribute alone is not a
-passed documentation build.
+Private operational ledgers, reviewer payloads, raw local captures, and the local
+Beads database do not automatically travel with a cloud clone. Original local
+records are preserved separately, not converted into invented passing evidence.
 
-## Final-phase commands
+## Reproducible checks
 
-These gates were run locally during final validation; CI repeats them:
+Use Node 24 and the platform prerequisites declared in the workflows/manifests.
+From the repository root:
 
-```powershell
+```sh
 cargo fmt --all -- --check
 cargo check --workspace --all-features --locked
-$env:RUSTDOCFLAGS = '-D missing_docs -D rustdoc::broken_intra_doc_links'
-cargo doc -p revenant-core -p revenant-sdk -p revenant-macros -p revenant-desktop --all-features --no-deps --locked
+cargo check -p revenant-desktop --no-default-features --locked
 cargo test --workspace --all-features --locked
-npm install --prefix packages/client
+npm ci --install-links --prefix packages/client
 npm run check --prefix packages/client
 npm run check:ui --prefix packages/client
 node scripts/check-api-docs.mjs
 npm test --prefix packages/client
-cargo build -p revenant --locked
+npm run test:ui --prefix packages/client
+node --test scripts/inspection-semantic.test.mjs scripts/evaluate-agent-workflow.test.mjs
+python -m unittest discover -s scripts/tests -p 'test_benchmark_*.py'
 ```
 
-From each migrated reference app, use the compiled CLI to `build`, then run the
-frontend's `npm run check` in `web/`. A fresh scaffold outside the checkout must
-also build and expose its local SDK sources. The workflow archives rustdoc and
-Windows bundle outputs, but producing installers is only build evidence.
+Strict Rust documentation uses `cargo doc --workspace --all-features --no-deps --locked`
+with `RUSTDOCFLAGS='-D missing_docs -D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags'`.
+The workflows additionally build migrated reference apps and an outside-checkout
+scaffold, compare compiled contracts, and record package provenance. Consult them
+for exact platform-specific commands.
 
-## Required direct acceptance evidence
+## Acceptance boundaries
 
-For the 500,000-file run record the dataset shape/count, hardware, elapsed scan
-and query times, native/UI memory, page bounds, native queue admission/rejection,
-all-matching selection behavior, paged partial outcomes, cancellation and cleanup.
-Do not substitute a tiny fixture or SQLite-only benchmark for the full workflow.
+- **Packages:** build real consumers with the normal CLI/SDK workflow and verify
+  installer/source identity; installer output alone is not installed acceptance.
+- **Windows:** exercise folder access, previews, operations, bounded results,
+  persistence, failures, cancellation and close with active work without Vite or
+  development tools. Measure WebView2 absence before claiming offline provisioning;
+  never remove the user's host runtime merely to manufacture a baseline.
+- **Editor:** verify actual Rust/generated TypeScript hover/source navigation;
+  language-server output alone does not establish visible editor behavior.
+- **Performance:** follow [BENCHMARKS.md](BENCHMARKS.md), recording source, workload,
+  hardware, contention, transfer/preparation costs, memory, bounds and cleanup.
+  Tiny fixtures or uncontrolled historical comparisons do not prove a speedup.
 
-For Zed, open the framework workspace and a fresh scaffold. Ensure rust-analyzer
-loads the root workspace plus the optional `native/Cargo.toml` when present and
-the generated `.revenant/desktop/Cargo.toml`. Link standalone app manifests explicitly
-if the editor only loads one workspace. Check `Application`, operation macros,
-`TaskContext` and module navigation, then generated TypeScript hovers and operation
-source metadata. Presence of source links/configuration is not proof of working
-editor navigation.
-
-For packaging, install the produced Windows package independently of Vite,
-Node/Cargo and the CLI checkout. Exercise folder access, supported previews,
-checksum/custom operation, paged batch results, settings across relaunch,
-permission/path failures, cancellation, close with active work and resource cleanup.
-Record WebView2 availability; an installer output alone does not prove offline
-installation on a machine lacking that runtime.
-
-## Recorded acceptance
-
-The [machine-readable run](validation/native-500000.json) describes the real
-fixture and workload limitations. On a Ryzen 7 5800X with approximately 64 GiB
-RAM, native folder admission took 0.142 ms and returned without discovery.
-The first query returned in 74.7 ms; metadata discovery finished in 58.1 s.
-All 500,000 checksum operations succeeded in 359.1 s. Peak native working set
-was 56,864,768 bytes; result/window pages contained at most 128 rows. Native
-cleanup left zero file resources and zero index/result stores. This was a
-contended run, not an isolated benchmark, and almost all fixture files are empty.
-
-The installed file/media app used the actual Windows folder picker. After
-discovery it displayed `entry499999.txt`, with 14 rendered rows and 4,525,752
-bytes of collected JavaScript heap. The virtualizer measures at most 4,096 rows;
-the scroll surface was 311,296 pixels. End-range navigation avoids WebView2's
-finite CSS height limit, which the former whole-folder spacer exceeded.
-Selecting and processing entries after a search replacement succeeded.
-Cancelling an all-matching batch retained 2,366 successful outcomes, displaying
-64 at once; the next page began at ordinal 64. Text preview and remembered
-preferences worked. Navigating away released all native file/media resources
-and tasks. The custom record operation normalized three records in the installed
-application. Prime sieve computed 9,592 primes through 100,000 and verified 97
-as prime in its production window. Native PNG decoding and audio range reads
-passed; invalid ranges returned 416 and disposed preview URLs returned 404.
-Closing the installed window while discovery and batch preparation were active
-exited in 69 ms. This close check exercised queued/preparation cancellation;
-the native regression suite separately covers an uncooperative running executor.
-The refreshed installer also launched with only Windows directories on the
-child PATH, without debugger arguments; the application and its owned children
-had zero TCP listeners. A real portable development run preserved its existing
-window and bindings after a compile failure, rebuilt successfully after repairs
-and subsequent edits, and cleaned up its desktop/Vite processes and temporary
-launch copies. Those copies allow Windows to rebuild the target executable while
-the current app remains open.
-
-Actual rust-analyzer hover/definition resolved `Application::new` and `operations!`
-to readable installed SDK source. Macro expansion resolved the native operation
-factory. Fresh Zed worktree logs and processes confirmed both the native author
-manifest and generated bootstrap. TypeScript 5.9.3 consumer hover returned the
-operation's Rust documentation and a valid source link after fixing JSDoc
-attachment to generated members. These are semantic/project-discovery checks;
-no visual Zed hover popup is claimed. The consumer probe was repeated against
-the final refreshed file/media facade and still resolved documentation and source.
-
-Reproduction helpers are `scripts/create-file-fixture.py`, the desktop
-`acceptance` binary, `scripts/check-ide.mjs`, `scripts/check-desktop-ui.mjs`, and
-`scripts/select-native-folder.ps1`. UI inspection uses an explicitly enabled
-local WebView2 debugger; offline emulation affects that target only.
-
-## Remaining release limits
-
-Remote Windows CI has not been run. Visual Zed hover inspection remains
-unverified. The generated NSIS package includes offline WebView2 support and
-installed successfully on this machine, which already has WebView2; installation
-on a clean machine lacking that runtime remains unverified. Removing the shared
-runtime from the user's machine is not an acceptance test. No release approval
-is implied by these local results. Prime-sieve's frontend dependencies were
-updated within their declared ranges and its package/checks rerun successfully.
-The npm audit now reports three low-severity advisories in each reference app;
-high/moderate advisories previously reported in prime-sieve were removed.
-
-## Historical evidence
-
-[October 1 validation](history/VALIDATION-0.2.md) retains the previously reported
-Rust/client/browser/HTTP/scaffold/watcher results for 0.2. They were not rerun for
-desktop 0.3. The old commands target removed hosts and are not current instructions.
-[Recon/design findings](history/DESIGN-2026-09-30.md) remain useful history.
-The old Beads issues remain historical; this sidecar does not rewrite their results.
+See [Windows acceptance](WINDOWS-ACCEPTANCE.md), [platform smoke](PLATFORM-SMOKE.md),
+[SDK recovery](SDK.md), and [native workflows](native-workflows.md).
+[Earlier 0.2 evidence](history/VALIDATION-0.2.md) remains explicitly historical.

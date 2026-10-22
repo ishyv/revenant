@@ -4,6 +4,8 @@ import type { RuntimeError } from "./contracts.js";
 import { Signal } from "./store.js";
 import type { NativeRequest, NativeTransport } from "./transport.js";
 
+const CLEANUP_ERROR_LIMIT = 64;
+
 /** Scope resources support deterministic, idempotent cleanup. */
 export interface Disposable {
   /** Release local and native ownership; implementations must tolerate repeated calls. */
@@ -16,7 +18,7 @@ export class Scope implements Disposable {
   private closed = false;
   private nativeId?: string;
   private cleanup?: Promise<void>;
-  /** Cleanup failures remain observable rather than becoming unhandled rejections. */
+  /** Newest 64 cleanup failures; subscribers are notified of every framework-reported failure. */
   readonly cleanupErrors = new Signal<readonly RuntimeError[]>([]);
   /** Resolves after both parent and child have been created on the host. */
   readonly ready: Promise<string>;
@@ -107,10 +109,10 @@ export class Scope implements Disposable {
             resource instanceof Scope
               ? resource.disposeAsync()
               : resource.dispose(),
-          ).catch((error) => this.report(error)),
+          ).catch((error) => this.reportCleanup(error)),
         );
       } catch (error) {
-        this.report(error);
+        this.reportCleanup(error);
       }
     }
     this.resources.clear();
@@ -121,19 +123,22 @@ export class Scope implements Disposable {
         const scope = await this.identity;
         await this.transport.dispatch({ action: "scope.dispose", scope });
       } catch (error) {
-        this.report(error);
+        this.reportCleanup(error);
       }
     })();
   }
 
-  private report(error: unknown): void {
+  /** Report cleanup failure even after closure, retaining recent diagnostics rather than a durable log. */
+  reportCleanup(error: unknown): void {
     this.cleanupErrors.set([
-      ...this.cleanupErrors.current,
+      ...this.cleanupErrors.current.slice(-(CLEANUP_ERROR_LIMIT - 1)),
       errorOf(error, "cleanup_failed"),
     ]);
   }
 
-  /** Wait for resources and native scope cleanup. */
+  /** Wait for owned disposal requests and native scope teardown acknowledgement.
+   * Cooperative native execution may continue retaining leases until its actual exit.
+   */
   async disposeAsync(): Promise<void> {
     this.dispose();
     await this.cleanup;

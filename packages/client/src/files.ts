@@ -1,6 +1,7 @@
 /** Native folders and bounded indexed windows. No file bytes or complete scans enter JS. */
 import {
   CapabilityError,
+  cloneJson,
   errorOf,
   failure,
   windowBounds,
@@ -60,6 +61,8 @@ export interface FolderBookmark {
 export interface FolderDescriptor {
   /** Opaque scoped native folder resource identity. */
   folder: string;
+  /** Typed native directory capability for custom Rust operation arguments. */
+  capability?: Handle;
   /** Native folder display name suitable for presentation. */
   name: string;
   /** Native display path; it is not a file capability. */
@@ -70,6 +73,14 @@ export interface FolderDescriptor {
 interface ViewResponse {
   view: string;
   snapshot: FileCollectionSnapshot;
+}
+interface RefreshRun {
+  cancelled: boolean;
+  admitted: boolean;
+  view?: string;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+  stop: () => void;
 }
 
 /** Native folder picker. User cancellation resolves to undefined. */
@@ -120,6 +131,14 @@ export class Folder {
   /** Native display path, not an authorization token. */
   get path(): string {
     return this.descriptor.path;
+  }
+  /** Native directory authority for a Rust FolderHandle argument. Display paths grant no authority. */
+  get capability(): Handle {
+    this.owner.assert();
+    if (this.disposed) failure("folder_disposed", "Native folder has been disposed");
+    if (!this.descriptor.capability)
+      failure("folder_capability_missing", "Upgrade the native SDK to use custom folder operations");
+    return { ...this.descriptor.capability };
   }
   /** Serializable host bookmark, suitable for native settings restoration. */
   get bookmark(): FolderBookmark {
@@ -192,6 +211,7 @@ export class FileCollection implements Readable<FileCollectionSnapshot> {
   private retiredViews = new Set<Promise<void>>();
   private lastSnapshotRevision = -1;
   private lastSnapshotView?: string;
+  private refreshRun?: RefreshRun;
   /** Standard Svelte store subscription. */
   readonly subscribe = this.store.subscribe;
 
@@ -280,6 +300,18 @@ export class FileCollection implements Readable<FileCollectionSnapshot> {
       offset: this.desiredOffset,
       warnings: Object.freeze([...snapshot.warnings]),
     });
+    this.reconcileRefresh();
+  }
+
+  private reconcileRefresh(): void {
+    const refresh = this.refreshRun;
+    const snapshot = this.snapshot;
+    if (refresh?.admitted && !refresh.cancelled &&
+      snapshot.view === refresh.view && snapshot.generation === this.generation &&
+      snapshot.state !== "loading") {
+      this.finishRefresh(refresh, snapshot.state === "ready" ? undefined :
+        snapshot.error ?? new CapabilityError("refresh_failed", "Folder refresh did not complete"));
+    }
   }
 
   private receive(
@@ -306,7 +338,10 @@ export class FileCollection implements Readable<FileCollectionSnapshot> {
         revision: snapshot.revision,
       });
     }).catch((error) => {
+      if (errorOf(error).code === "view_disposed" &&
+        (this.disposed || snapshot.generation !== this.generation)) return;
       this.acknowledgementError = errorOf(error, "view_ack_failed");
+      if (this.refreshRun) this.finishRefresh(this.refreshRun, error);
       if (!this.disposed) this.store.set({
         ...this.snapshot, state: "failed", error: this.acknowledgementError,
       });
@@ -346,12 +381,14 @@ export class FileCollection implements Readable<FileCollectionSnapshot> {
   private async submitQuery(
     generation: number,
     options: FileQueryOptions,
+    refresh?: RefreshRun,
   ): Promise<void> {
     let response: ViewResponse;
+    const lineage = refresh ?? this.refreshRun;
     try {
       response = await this.owner.request<ViewResponse, FileCollectionSnapshot>(
         {
-          action: this.view ? "view.query" : "folder.query",
+          action: refresh ? "view.refresh" : this.view ? "view.query" : "folder.query",
           ...(this.view ? { view: this.view } : { folder: this.folder }),
           options,
           generation,
@@ -362,13 +399,28 @@ export class FileCollection implements Readable<FileCollectionSnapshot> {
           this.receive(snapshot);
         },
       );
+      if (refresh) {
+        refresh.view = response.view;
+        refresh.admitted = true;
+      }
+      if (lineage?.cancelled || this.disposed) {
+          // Even a cancelled invoke owns its returned page until its ACK. It
+          // cannot replace the active identity or keep its scanner alive.
+          this.receive(response.snapshot, () => false);
+          this.retire(response.view);
+          return;
+      }
+      if (lineage?.admitted) lineage.view = response.view;
       const previous = this.view;
       this.view = response.view;
       this.receive(response.snapshot);
+      // Reconcile a terminal Channel page accepted before the admission reply.
+      this.reconcileRefresh();
       if (previous && previous !== response.view) {
         this.retire(previous);
       }
     } catch (error) {
+      if (lineage && !lineage.cancelled) this.finishRefresh(lineage, error);
       if (!this.disposed && generation === this.generation) {
         this.store.set({
           ...this.snapshot,
@@ -447,6 +499,77 @@ export class FileCollection implements Readable<FileCollectionSnapshot> {
     return this.queryWork;
   }
 
+  private finishRefresh(run: RefreshRun, error?: unknown): void {
+    if (this.refreshRun !== run) return;
+    this.refreshRun = undefined;
+    run.stop();
+    if (error === undefined) run.resolve(); else run.reject(error);
+  }
+
+  private cancelRefresh(run: RefreshRun, code: string, message: string): void {
+    run.cancelled = true;
+    this.finishRefresh(run, new CapabilityError(code, message));
+    if (run.admitted && run.view) {
+      const view = run.view;
+      void this.owner.ready.then((scope) => this.owner.transport.dispatch({
+        action: "view.cancel", scope, view,
+      })).catch(() => {});
+    }
+  }
+
+  /** Rescan this collection's inventory, retaining query options and clearing its
+   * viewport and selections. Resolves after discovery completes; abort,
+   * disposal and another refresh reject the promise. Query changes during the
+   * scan stay on its new inventory. Other collections retain their inventory.
+   */
+  refresh(options: {
+    /** Cancel this collection's replacement scan and reject its completion promise. */
+    signal?: AbortSignal;
+  } = {}): Promise<void> {
+    this.assert();
+    if (options.signal?.aborted) {
+      return Promise.reject(new CapabilityError("refresh_cancelled", "Folder refresh was cancelled"));
+    }
+    if (this.refreshRun) this.cancelRefresh(this.refreshRun, "refresh_superseded", "A newer folder refresh superseded this scan");
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const result = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    void result.catch(() => {});
+    const run: RefreshRun = { cancelled: false, admitted: false, resolve, reject, stop: () => {} };
+    this.refreshRun = run;
+    const abort = () => {
+      this.cancelRefresh(run, "refresh_cancelled", "Folder refresh was cancelled");
+      if (!this.disposed) {
+        this.generation++;
+        this.windowRevision++;
+        this.store.set({ ...this.snapshot, generation: this.generation, items: [],
+          state: "failed", error: errorOf(new CapabilityError("refresh_cancelled", "Folder refresh was cancelled")) });
+      }
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    run.stop = () => options.signal?.removeEventListener("abort", abort);
+    const generation = ++this.generation;
+    this.windowRevision++;
+    this.desiredOffset = 0;
+    const previous = this.queryWork;
+    const captures = [...this.captures];
+    this.store.set({ ...this.snapshot, generation, offset: 0, items: [],
+      state: "loading", error: undefined });
+    this.queryWork = previous.catch(() => {}).then(async () => {
+      if (run.cancelled || this.disposed) return;
+      this.assert();
+      await Promise.allSettled(captures);
+      if (run.cancelled || this.disposed) return;
+      if (!this.view) failure("view_not_ready", "The native collection has not been created");
+      await this.submitQuery(generation, { ...this.options }, run);
+    }).catch((error) => {
+      if (!run.cancelled) this.finishRefresh(run, error);
+      throw error;
+    });
+    void this.queryWork.catch(() => {});
+    return result;
+  }
+
   /** Change search using native filtering, preserving other current options. */
   filter(search: string): Promise<void> {
     return this.query({ ...this.options, search });
@@ -481,6 +604,7 @@ export class FileCollection implements Readable<FileCollectionSnapshot> {
   /** Dispose view ownership; late creation acknowledgements are reclaimed too. */
   dispose(): Promise<void> {
     if (this.cleanup) return this.cleanup;
+    if (this.refreshRun) this.cancelRefresh(this.refreshRun, "view_disposed", "Collection was disposed during refresh");
     this.disposed = true;
     this.released?.();
     this.store.set({ ...this.snapshot, items: [], state: "disposed" });
@@ -595,7 +719,7 @@ export class FileSelection implements Readable<readonly FileEntry[]> {
       failure("invalid_selection", "Entries must belong to this native view");
     }
     const entries = Object.freeze([...unique.values()]);
-    const handles = entries.map((entry) => structuredClone(entry.handle));
+    const handles = entries.map((entry) => cloneJson(entry.handle));
     const revision = ++this.revision;
     // Capture readiness now: a later query may itself wait for this lease acknowledgement.
     const viewReady = this.collection.ready;

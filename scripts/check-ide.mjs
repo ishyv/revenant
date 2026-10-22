@@ -1,5 +1,6 @@
 /** Real rust-analyzer stdio evidence; no source, preference, or dependency edits.
  * Usage: node scripts/check-ide.mjs --project <app> --allow-cargo [--build-scripts] [--zed]
+ * Use --typescript-only --builtin-checksum for a minimal app's generated hover.
  * rust-analyzer uses Cargo metadata/build scripts: coordinate the Cargo slot first.
  * JSON goes to stdout; keep it in the caller's evidence store, not this script.
  */
@@ -139,13 +140,17 @@ function typescriptEvidence() {
   const forwarder = path.join(project, 'web', 'src', 'lib', 'revenant.ts');
   const reference = /export \* from ['"]([^'"]+)['"]/.exec(read(forwarder));
   if (!reference) throw new Error('Generated TypeScript forwarder has no facade export.');
-  const file = path.resolve(path.dirname(forwarder), reference[1] + '.ts');
+  const file = path.resolve(path.dirname(forwarder),
+    reference[1].endsWith('.ts') ? reference[1] : reference[1] + '.ts');
   const source = read(file);
-  const needle = /["']normalize["']\s*:\s*Operation</.exec(source);
-  if (!needle) throw new Error('Current facade has no typed records.normalize declaration.');
+  const builtin = args.includes('--builtin-checksum');
+  const symbol = builtin ? 'files.checksum' : 'records.normalize';
+  const member = builtin ? 'checksum' : 'normalize';
+  const needle = new RegExp(`["']${member}["']\\s*:\\s*Operation<`).exec(source);
+  if (!needle) throw new Error(`Current facade has no typed ${symbol} declaration.`);
   const usageFile = path.join(path.dirname(file), '__ide_hover_probe__.ts');
-  const usage = "import type { Application } from './facade';\ndeclare const app: Application;\napp.operations.records.normalize;\n";
-  const offset = usage.indexOf('normalize') + 2;
+  const usage = `import type { Application } from './facade';\ndeclare const app: Application;\napp.${builtin ? symbol : 'operations.' + symbol};\n`;
+  const offset = usage.lastIndexOf(member) + 2;
   const isUsage = filename => path.resolve(filename).toLowerCase() === usageFile.toLowerCase();
   const options = { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler, skipLibCheck: true };
@@ -170,12 +175,12 @@ function typescriptEvidence() {
       return { file: target, line, exists: fs.existsSync(target),
         sourceLine: fs.existsSync(target) ? read(target).split(/\r?\n/)[line - 1]?.trim().slice(0, 300) : null };
     });
-    return { version: ts.version, file, symbol: 'records.normalize',
+    return { version: ts.version, file, symbol,
       hover: { signature, documentation: docs.slice(0, 4500), tags: quick?.tags },
       generatedDefinitions: targets.map(target => ({ file: target.fileName,
         position: position(read(target.fileName), target.textSpan.start) })),
       rustSourceLinks: links,
-      verified: docs.includes('Trim and uppercase') && links.some(link => link.exists && link.sourceLine?.includes('operation'))
+      verified: docs.includes(builtin ? 'Hashes a leased file' : 'Trim and uppercase') && links.some(link => link.exists && link.sourceLine?.includes('operation'))
         && targets.length > 0,
       visualHoverVerified: false };
   } finally { service.dispose(); }

@@ -112,7 +112,7 @@ use revenant_desktop::{DesktopOptions, DesktopRuntime};
 use revenant_sdk::Application;
 use serde_json::{Value, json};
 use std::{sync::atomic::Ordering, time::Duration};
-use support::{Harness, error, rows};
+use support::{Harness, error, rows, transient_cache_empty};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bounded_windows_ack_retention_and_selection_capture() {
@@ -320,12 +320,7 @@ async fn partial_cancel_keeps_completed_outcomes_and_releases_scope() {
     );
     h.runtime.dispose_window("acceptance-window").unwrap();
     h.runtime.shutdown().await.unwrap();
-    assert!(
-        std::fs::read_dir(h.directory.path().join("cache"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(transient_cache_empty(&h.directory.path().join("cache")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -661,9 +656,9 @@ fn public_prepared_operation_handles_and_core_interrupt_remain_usable() {
         .unwrap();
     let prepared = registry.prepare_operation("echo").unwrap();
     let resources = ResourceRegistry::new();
-    resources.create_scope("scope", None).unwrap();
+    let scope = resources.create_scope(None).unwrap();
     let tasks = TaskManager::new(resources);
-    let context = tasks.create("scope", "interrupt").unwrap();
+    let context = tasks.create(&scope, "interrupt").unwrap();
     let execution = context.begin().unwrap();
     assert_eq!(context.interrupt().unwrap().state, TaskState::Interrupted);
     assert_eq!(

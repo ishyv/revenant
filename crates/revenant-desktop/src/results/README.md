@@ -57,6 +57,20 @@ Dropping the final store/lease closes the SQLite connection, removes its private
 temporary directory, then releases the batch owner. This ordering permits
 temporary cleanup on Windows without an open SQLite connection.
 
+The connection also retains an OS exclusive ownership lease. Forced termination
+releases that lease so the next desktop startup can reclaim the marked store.
+Recovery preserves live result leases, unmarked legacy directories, links, and
+unexpected children. Its bounded report is available through
+`DesktopRuntime::store_recovery()`; sharing violations and inaccessible stores
+are retained for a later startup retry. Recovery never touches durable settings,
+catalogs, or originals.
+
+Small marked recovery metadata persists in `.revenant-native-stores` below the
+cache root. Its leased journal and persisted cursor provide bounded progress
+past live, locked, and unmarked paths across repeated startups; registration is
+flushed before store ownership is published. Compaction retains every live or
+deferred store reference before advancing the cursor.
+
 All store methods and final cleanup are synchronous storage operations. The
 host owns bounded scheduling and should keep large writes, queries, and final
 owner disposal off its UI thread; this module creates no background workers.

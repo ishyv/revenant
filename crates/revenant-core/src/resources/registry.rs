@@ -1,11 +1,29 @@
 //! Registry ownership is distinct from lease ownership. IDs increase monotonically and are never reused within a registry.
 use super::*;
-#[derive(Default)]
 pub(super) struct Resources {
+    pub(super) scope_instance: String,
+    pub(super) issued_scope: u64,
     pub(super) scopes: HashMap<String, Scope>,
-    pub(super) resources: HashMap<String, Arc<Resource>>,
+    pub(super) resources: HashMap<String, Arc<FileResource>>,
+    pub(super) native_resources: HashMap<String, NativeResourceLease>,
+    pub(super) native_live: Arc<AtomicUsize>,
     pub(super) providers: HashMap<String, std::sync::Weak<AtomicUsize>>,
     pub(super) next_resource: u64,
+}
+
+impl Default for Resources {
+    fn default() -> Self {
+        Self {
+            scope_instance: uuid::Uuid::new_v4().simple().to_string(),
+            issued_scope: 0,
+            scopes: HashMap::new(),
+            resources: HashMap::new(),
+            native_resources: HashMap::new(),
+            native_live: Arc::new(AtomicUsize::new(0)),
+            providers: HashMap::new(),
+            next_resource: 0,
+        }
+    }
 }
 
 /// Host-owned chunk access. TaskContext validates the handle and holds its resource
@@ -107,7 +125,7 @@ impl ResourceRegistry {
         }
         inner.resources.insert(
             handle.id.clone(),
-            Arc::new(Resource {
+            Arc::new(FileResource {
                 handle,
                 metadata,
                 port,
@@ -117,7 +135,7 @@ impl ResourceRegistry {
         );
         Ok(entry)
     }
-    fn checked(inner: &Resources, scope: &str, handle: &Handle) -> Result<Arc<Resource>> {
+    fn checked(inner: &Resources, scope: &str, handle: &Handle) -> Result<Arc<FileResource>> {
         Self::active(inner, scope)?;
         if handle.scope != scope {
             return Err(Error::new(
@@ -141,20 +159,43 @@ impl ResourceRegistry {
     /// Returns `scope_disposed`, `scope_mismatch`, or `stale_handle`. A captured
     /// lease remains valid even when this fresh-admission check fails after release.
     pub fn validate(&self, scope: &str, handle: &Handle) -> Result<()> {
-        Self::checked(&lock(&self.inner), scope, handle).map(|_| ())
+        let inner = lock(&self.inner);
+        if inner.native_resources.contains_key(&handle.id) {
+            Self::checked_native(&inner, scope, handle).map(|_| ())
+        } else {
+            Self::checked(&inner, scope, handle).map(|_| ())
+        }
     }
     /// Admits a capability by validating its scope, ID, generation, and kind.
     /// Returns the same errors as validate. The captured Arc authorizes subsequent
     /// reads independently of owner release; clones extend the resource lifetime.
     pub fn lease(&self, scope: &str, handle: &Handle) -> Result<ResourceLease> {
+        let inner = lock(&self.inner);
+        if inner.native_resources.contains_key(&handle.id) {
+            Self::checked_native(&inner, scope, handle)?;
+            return Err(Error::new("wrong_kind", "Expected a file resource"));
+        }
         Ok(ResourceLease {
-            resource: Self::checked(&lock(&self.inner), scope, handle)?,
+            resource: Self::checked(&inner, scope, handle)?,
         })
     }
     /// Releases only the registry owner after full handle validation.
     /// Existing leases remain readable; cleanup waits for the final lease. Returns
     /// admission errors for stale, mismatched, or disposed handles, including repeat release.
     pub fn release(&self, scope: &str, handle: &Handle) -> Result<()> {
+        let native = {
+            let mut inner = lock(&self.inner);
+            if inner.native_resources.contains_key(&handle.id) {
+                Self::checked_native(&inner, scope, handle)?;
+                inner.native_resources.remove(&handle.id)
+            } else {
+                None
+            }
+        };
+        if native.is_some() {
+            drop(native);
+            return Ok(());
+        }
         let resource = {
             let mut inner = lock(&self.inner);
             Self::checked(&inner, scope, handle)?;

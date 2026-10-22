@@ -10,19 +10,15 @@ use std::{
 };
 
 pub(crate) struct Database {
-    // Declaration order closes SQLite before removing the directory on Windows.
+    // Declaration order closes SQLite before removing the directory under its
+    // process lease. Result/index Arcs retain both for every admitted consumer.
     pub connection: Connection,
-    pub directory: tempfile::TempDir,
+    pub directory: crate::native_store::OwnedStore,
 }
 
 impl Database {
     pub fn new(cache_dir: &Path, prefix: &str) -> Result<Self> {
-        let cache_dir = std::path::absolute(cache_dir).map_err(io_error)?;
-        std::fs::create_dir_all(&cache_dir).map_err(io_error)?;
-        let directory = tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir_in(&cache_dir)
-            .map_err(io_error)?;
+        let directory = crate::native_store::OwnedStore::create(cache_dir, prefix)?;
         let connection =
             Connection::open(directory.path().join("store.sqlite3")).map_err(sql_error)?;
         connection
@@ -78,15 +74,17 @@ pub(crate) fn encode_path(path: &Path) -> Vec<u8> {
 #[cfg(windows)]
 pub(crate) fn decode_path(bytes: Vec<u8>) -> Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(Error::new(
             "invalid_path",
             "Stored native path is malformed",
         ));
     }
     let wide: Vec<_> = bytes
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
         .collect();
     Ok(std::ffi::OsString::from_wide(&wide).into())
 }

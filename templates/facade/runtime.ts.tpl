@@ -58,4 +58,19 @@ export function useApp(app?: Application): Application {
   return bindApp(useRuntimeApp<{{checksum_type}}, {{metadata_type}}>(app));
 }
 
+/** Callable compiled operations bound to their owner's scope. */
+export interface Operations {
+{{callable_types}}
+}
+
+/** Bind an explicit owner's exact scope; omitted owners use a component scope.
+ * Explicit owners keep their existing disposal responsibility.
+ */
+export function useOperations(app?: Application): Operations {
+  const runtime = app === undefined ? useApp() : bindApp(app);
+  return {
+{{callables}}
+  };
+}
+
 export default createApp;

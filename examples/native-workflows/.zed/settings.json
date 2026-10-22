@@ -1,0 +1,21 @@
+{
+  "lsp": {
+  "rust-analyzer": {
+    "initialization_options": {
+      "linkedProjects": [
+        "./native/Cargo.toml",
+        "./.revenant/desktop/Cargo.toml"
+      ]
+    }
+  }
+},
+  "file_scan_inclusions": [
+  "...",
+  ".revenant/desktop/**",
+  ".revenant/sdk/crates/**"
+],
+  "project_panel": {
+  "hide_hidden": false,
+  "hide_gitignore": false
+}
+}

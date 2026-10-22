@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { setupApp } from '$lib/revenant';
+  import { setupApp } from '#lib/revenant.ts';
   import type { Snippet } from 'svelte';
   import '@hyvnt/hyvui/styles.css';
   import '@hyvnt/hyvui/fonts.css';

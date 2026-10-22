@@ -1,11 +1,13 @@
 import type { ImageOperations, ImageRenderer } from "./types";
 
-/** Admit one-shot native reads through the queue; Operation.call owns task cleanup. */
+/** Admit native rendition calls through the queue; the callable owns task cleanup. */
 export function createImageRenderer(
-  operation: Pick<ImageOperations["render"], "call">,
+  operation: (input: Parameters<ImageOperations["render"]>[0]) => ReturnType<ImageOperations["render"]>,
+  onWarning: (warning: string) => void = () => {},
 ): ImageRenderer {
   return imageQueue(async (id, large) => {
-    const rendition = await operation.call({ id, large });
+    const rendition = await operation({ id, large });
+    if (rendition.cacheWarning) onWarning(rendition.cacheWarning);
     return rendition.dataUrl;
   });
 }

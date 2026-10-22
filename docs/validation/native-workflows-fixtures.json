@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "scope": "framework and fixtures; application migrations deferred",
+  "seed": 378,
+  "buildProfile": "release for performance; debug results labeled separately",
+  "sourceIdentity": "each measurement records source SHA256, Git HEAD, dirty state and contract digest",
+  "fixtures": {
+    "cpu": {"entries": [500000, 1000000], "topologies": ["flat", "deep", "mixed"], "algorithm": "identical deterministic serial and scheduled integer transform/reduction"},
+    "slowIo": {"blockedMilliseconds": 250, "sessions": [1, 4]},
+    "query": {"sessions": [1, 4], "readsPerRepeat": 100, "interactiveP95TargetMilliseconds": 50},
+    "scene": {"primitives": 50000, "changedKeys": 500, "settledPatchUploadFractionTarget": 0.1, "nativeInteractionTargetHz": 60},
+    "lifecycle": {"fullCycles": 20, "identityCycles": 100000},
+    "compute": {"cases": ["resident multi-stage transform and reduction", "small upload-transform-readback"], "includeTransfersAndPreparation": true}
+  },
+  "protocol": {"warmupRuns": 2, "measuredRepeats": 5, "cacheStates": ["cold", "warm"], "observers": "record enabled instrumentation; no file contents or argument dumps"},
+  "baselineVerification": {"coreScopeAndUpdateTests": 7, "clientTests": 67, "performanceMeasured": false}
+}

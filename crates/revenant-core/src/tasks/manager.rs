@@ -4,13 +4,19 @@ use super::*;
 /// Completed tasks remain retained until explicitly removed by the host.
 #[derive(Clone)]
 pub struct TaskManager {
+    services: Arc<TaskServices>,
     resources: ResourceRegistry,
     tasks: Arc<Mutex<HashMap<String, TaskContext>>>,
 }
 impl TaskManager {
     /// Creates an empty manager sharing the supplied registry and its scope lifetimes.
     pub fn new(resources: ResourceRegistry) -> Self {
+        Self::with_services(resources, Arc::new(TaskServices::default()))
+    }
+    /// Creates tasks with immutable resolved host services, inherited by children.
+    pub fn with_services(resources: ResourceRegistry, services: Arc<TaskServices>) -> Self {
         Self {
+            services,
             resources,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -37,6 +43,8 @@ impl TaskManager {
             ));
         }
         let snapshot = TaskSnapshot {
+            revision: 0_u64.into(),
+            update: None,
             id: task_id.into(),
             scope: scope.into(),
             state: TaskState::Queued,
@@ -49,6 +57,7 @@ impl TaskManager {
         };
         let context = TaskContext {
             task: Arc::new(Task {
+                services: self.services.clone(),
                 id: task_id.into(),
                 scope: scope.into(),
                 resources: self.resources.clone(),
@@ -57,6 +66,10 @@ impl TaskManager {
                     snapshot,
                     started: false,
                     leases: HashMap::new(),
+                    native_leases: HashMap::new(),
+                    created_native: HashMap::new(),
+                    update_schema: None,
+                    work_class: None,
                     listeners: BTreeMap::new(),
                     next_listener: 1,
                     cancellation_probe: None,

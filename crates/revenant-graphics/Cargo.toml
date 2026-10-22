@@ -1,0 +1,38 @@
+[package]
+name = "revenant-graphics"
+version = "0.4.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded native 2D scenes and optional GPU rendering for Revenant"
+
+[features]
+default = []
+experimental-compute = ["gpu", "revenant-core/experimental-compute"]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:raw-window-handle", "dep:fontdue", "dep:png", "dep:sha2", "dep:tempfile", "dep:zip"]
+
+[dependencies]
+revenant-core = { version = "0.4.0", path = "../revenant-core" }
+serde = { version = "1", features = ["derive"] }
+wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+pollster = { version = "0.4", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+png = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
+
+[build-dependencies]
+fontdue = { version = "0.9", optional = true }
+sha2 = { version = "0.10", optional = true }
+zip = { version = "2.4", optional = true, default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }

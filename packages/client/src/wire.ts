@@ -1,4 +1,4 @@
-/** Stable desktop dispatcher protocol: manifest 3 / protocol 2, command revenant_dispatch. */
+/** Stable desktop dispatcher protocol: manifest 6 / protocol 5, command revenant_dispatch. */
 import type { ContractManifest, Handle, ResultPage, TaskSnapshot, } from "./contracts.js";
 import type { FileCollectionSnapshot, FileQueryOptions, FolderDescriptor, FolderBookmark, } from "./files.js";
 import type { NativeSelection } from "./operation.js";
@@ -53,7 +53,7 @@ export interface SelectionConnection {
   /** Number of acknowledged explicit inputs, at most 512. */
   count: number;
 }
-/** Exact admitted request union. Input/config/defaults/value are validated lossless JSON data. */
+/** Core dispatcher requests; extension routes use NativeRequest. Payloads are validated lossless JSON. */
 export type DispatchRequest = {
   /** Exact dispatcher action discriminant for this admitted request. */
   action: "root.connect";

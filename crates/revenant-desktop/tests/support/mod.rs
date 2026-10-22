@@ -115,7 +115,7 @@ impl Provider for TestProvider {
             "Returns a typed native resource for retained-output acceptance",
             |input, ctx| async move {
                 ctx.checkpoint()?;
-                Ok(ctx.file_metadata(&input.handle)?.entry(input.handle)?)
+                ctx.file_metadata(&input.handle)?.entry(input.handle)
             },
         )?;
         if self.incompatible {
@@ -307,11 +307,11 @@ impl Harness {
                 .views
                 .get(snapshot["view"].as_str().unwrap())
                 .cloned();
-            if let Some(latest) = latest {
-                if latest["revision"].as_u64() > snapshot["revision"].as_u64() {
-                    snapshot = latest;
-                    continue;
-                }
+            if let Some(latest) = latest
+                && latest["revision"].as_u64() > snapshot["revision"].as_u64()
+            {
+                snapshot = latest;
+                continue;
             }
             match self.request(json!({"action":"view.window","view":snapshot["view"],"offset":snapshot["offset"],"limit":snapshot["limit"],"generation":snapshot["generation"]})).await {
                 Ok(next) => snapshot = next,
@@ -357,10 +357,7 @@ impl Harness {
         tokio::time::timeout(WATCHDOG, async {
             loop {
                 if self.inspect("files").await["resources"] == "0"
-                    && std::fs::read_dir(self.directory.path().join("cache"))
-                        .unwrap()
-                        .next()
-                        .is_none()
+                    && transient_cache_empty(&self.directory.path().join("cache"))
                 {
                     break;
                 }
@@ -370,6 +367,85 @@ impl Harness {
         .await
         .expect("scoped resources or SQLite stores leaked");
     }
+}
+
+// Only the matching marked recovery coordinator may remain after transient
+// stores are released. Unknown paths still fail the cleanup acceptance check.
+pub fn transient_cache_empty(cache: &std::path::Path) -> bool {
+    let cache = std::path::absolute(cache).unwrap();
+    #[cfg(windows)]
+    let encoded: Vec<u8> = {
+        use std::os::windows::ffi::OsStrExt;
+        cache
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(unix)]
+    let encoded: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        cache.as_os_str().as_bytes().to_vec()
+    };
+    std::fs::read_dir(&cache).unwrap().all(|entry| {
+        let entry = entry.unwrap();
+        if entry.file_name() != ".revenant-native-stores" {
+            return false;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return false;
+            }
+        }
+        let files_valid = std::fs::read_dir(entry.path()).unwrap().all(|file| {
+            let file = file.unwrap();
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            if ![
+                "owner.json",
+                "lease.lock",
+                "state.json",
+                "state.next.json",
+                "stores-a.log",
+                "stores-b.log",
+            ]
+            .contains(&name.as_ref())
+            {
+                return false;
+            }
+            let metadata = std::fs::symlink_metadata(file.path()).unwrap();
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return false;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return false;
+                }
+            }
+            true
+        });
+        if !files_valid {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(entry.path().join("owner.json")) else {
+            return false;
+        };
+        let Ok(owner) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        owner["format"] == 1
+            && owner["owner"] == "revenant-desktop"
+            && owner["kind"] == "native-store-recovery"
+            && owner["cache"] == json!(encoded)
+    })
 }
 
 pub fn rows(snapshot: &Value) -> &Vec<Value> {

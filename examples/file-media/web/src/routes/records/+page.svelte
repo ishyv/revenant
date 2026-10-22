@@ -1,12 +1,14 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { useApp } from '$lib/revenant';
-  import type { RecordsNormalize } from '$lib/revenant';
+  import { useApp, useOperations } from '#lib/revenant.ts';
+  import type { RecordsNormalize } from '#lib/revenant.ts';
   import type { Task } from '@revenant/client';
   import { TaskStatus } from '@revenant/client/ui';
+  import { errorOf } from '@revenant/client';
 
   const app = useApp().createScope();
-  const records = app.collection<RecordsNormalize.Input.ContractValue>([
+  const api = useOperations(app);
+  const records = app.collection<RecordsNormalize.Output.ContractValue>([
     { id: 'docs', title: '  write useful documentation  ', done: false },
     { id: 'ship', title: '  ship the damn thing ', done: false },
     { id: 'sleep', title: ' sleep ', done: true }
@@ -25,12 +27,12 @@
       // FileCollection selection tokens instead of copying a dataset to JS.
       for (const record of selected) {
         await task?.dispose();
-        task = app.operations.records.normalize.run(record);
+        task = api.records.normalize.run({ record });
         const result = await task.result;
         if (!alive) return;
         records.set(records.items.map((item) => item.id === result.id ? result : item));
       }
-    } catch (failure) { if (alive) error = failure instanceof Error ? failure.message : String(failure); }
+    } catch (failure) { if (alive) error = errorOf(failure).message; }
     finally { if (alive) running = false; }
   }
   onDestroy(() => { alive = false; app.dispose(); });

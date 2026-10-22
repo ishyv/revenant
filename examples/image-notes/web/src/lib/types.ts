@@ -1,14 +1,15 @@
 import type { OperationOutput } from "@revenant/client";
-import type { Application } from "./revenant";
+import type { Operations } from "./revenant";
 
 // Inferred from the compiled Rust contract; no duplicate handwritten wire DTOs.
-export type ImageOperations = Application["operations"]["images"];
+export type ImageOperations = Operations["images"];
 export type AssetPage = OperationOutput<ImageOperations["query"]>;
 export type Asset = AssetPage["items"][number];
 export type Startup = OperationOutput<ImageOperations["bootstrap"]>;
 export type Root = Startup["roots"][number];
 export type SavedNote = OperationOutput<ImageOperations["annotate"]>;
 export type ScanReport = OperationOutput<ImageOperations["scan"]>;
+export type CacheUsage = OperationOutput<ImageOperations["cacheUsage"]>;
 export type ImageRenderer = (
   id: string,
   large: boolean,

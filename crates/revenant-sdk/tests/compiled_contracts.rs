@@ -166,11 +166,13 @@ fn operation_macro_accepts_both_context_signatures_and_dispatches_typed_values()
 
     let (_, _, first_context) = fresh_task("no-context");
     let result =
-        block_on(registry.dispatch("tests.withoutContext", json!(40), first_context)).unwrap();
+        block_on(registry.dispatch("tests.withoutContext", json!({"input": 40}), first_context))
+            .unwrap();
     assert_eq!(result, json!(41));
 
     let (_, _, second_context) = fresh_task("with-context");
     let result =
-        block_on(registry.dispatch("tests.withContext", json!(40), second_context)).unwrap();
+        block_on(registry.dispatch("tests.withContext", json!({"input": 40}), second_context))
+            .unwrap();
     assert_eq!(result, json!(42));
 }

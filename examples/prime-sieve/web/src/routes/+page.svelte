@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { useApp } from '$lib/revenant';
-  import type { PrimesUpTo } from '$lib/revenant';
+  import { useApp, useOperations } from '#lib/revenant.ts';
+  import type { PrimesUpTo } from '#lib/revenant.ts';
   import type { Task } from '@revenant/client';
   import { TaskStatus } from '@revenant/client/ui';
 
   const app = useApp().createScope();
+  const api = useOperations(app);
   const preferences = app.settings.define({ limit: 100_000 }, { key: 'prime-sieve.preferences' });
   const persistence = preferences.status;
   let limit = $state(100_000);
@@ -25,7 +26,7 @@
     try {
       preferences.set({ limit });
       await task?.dispose();
-      const next = app.operations.primes.upTo.run({ limit });
+      const next = api.primes.upTo.run({ limit });
       task = next;
       const value = await next.result;
       if (alive && task === next) { result = value; elapsed = performance.now() - started; }
@@ -36,7 +37,7 @@
     error = '';
     try {
       const value = candidate;
-      const answer = await app.operations.primes.isPrime.call({ value });
+      const answer = await api.primes.isPrime({ value });
       if (alive) primality = `${value.toLocaleString()} is ${answer ? 'prime' : 'not prime'}.`;
     } catch (failure) { if (alive) error = failure instanceof Error ? failure.message : String(failure); }
   }

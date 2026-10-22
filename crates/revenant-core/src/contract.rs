@@ -138,7 +138,7 @@ impl TypeVisitor for Definitions {
 /// Returns `contract_collision` for conflicting names or a reserved alias,
 /// `asymmetric_contract` for unequal input/output schemas, and `lossy_integer`
 /// for integer ranges beyond JavaScript exact representation.
-pub fn type_definition<T: Contract + ?Sized>() -> Result<TypeDefinition> {
+pub fn type_definition<T: Contract>() -> Result<TypeDefinition> {
     let mut definitions = Definitions {
         seen: HashSet::new(),
         declarations: BTreeMap::new(),
@@ -311,4 +311,38 @@ pub fn validate_json(schema: &Value, value: &Value) -> Result<()> {
     validator
         .validate(value)
         .map_err(|e| Error::new("contract_validation", e.to_string()))
+}
+
+/// An immutable schema and its compiled validator. Share through an `Arc` owned
+/// by the installed contract generation; no process-global schema cache is used.
+pub struct PreparedValidator {
+    schema: Value,
+    validator: jsonschema::Validator,
+}
+impl std::fmt::Debug for PreparedValidator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedValidator")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+impl PreparedValidator {
+    /// Audits the wire schema and compiles it once with its declared dialect.
+    pub fn new(schema: Value) -> Result<Self> {
+        validate_contract_schema(&schema)?;
+        let validator = jsonschema::validator_for(&schema)
+            .map_err(|error| Error::new("invalid_schema", error.to_string()))?;
+        Ok(Self { schema, validator })
+    }
+    /// Exact immutable schema identity used to reject changed task update contracts.
+    pub fn schema(&self) -> &Value {
+        &self.schema
+    }
+    /// Checks a value using the compiled validator, preserving classified failures.
+    pub fn validate(&self, value: &Value) -> Result<()> {
+        self.validator
+            .validate(value)
+            .map_err(|error| Error::new("contract_validation", error.to_string()))
+    }
 }

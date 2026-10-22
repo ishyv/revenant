@@ -2,11 +2,38 @@ name: Luma Windows app
 
 on:
   push:
-    branches: [feat/image-notes-demo]
+    branches: [main, feat/image-notes-demo]
+    paths:
+      - 'examples/image-notes/**'
+      - 'src/**'
+      - 'crates/**'
+      - 'packages/client/**'
+      - 'templates/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/write-build-evidence.mjs'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'examples/image-notes/**'
+      - 'src/**'
+      - 'crates/**'
+      - 'packages/client/**'
+      - 'templates/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/write-build-evidence.mjs'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   windows:
@@ -17,6 +44,11 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify source checkout
+        run: |
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Unexpected source checkout' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -31,6 +63,13 @@ jobs:
         run: |
           cargo build -p revenant --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Repeat Windows shadow lifecycle tests
+        run: |
+          for ($iteration = 1; $iteration -le 10; $iteration++) {
+            Write-Host "Shadow lifecycle iteration $iteration/10"
+            cargo test -p revenant --test desktop_shadow --all-features --locked -- --nocapture
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
       - name: Build Luma desktop installer
         run: |
           $cli = (Resolve-Path target/debug/revenant.exe).Path
@@ -45,9 +84,21 @@ jobs:
             cargo test --manifest-path native/Cargo.toml --locked
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           } finally { Pop-Location }
+      - name: Compare actual compiled contract validators
+        run: |
+          npm ci --install-links --prefix packages/client
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run check:contracts --prefix packages/client -- ../../examples/image-notes
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify installer and source provenance
+        run: |
+          node scripts/write-build-evidence.mjs examples/image-notes/.revenant/target/release/bundle
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node scripts/write-build-evidence.mjs --verify examples/image-notes/.revenant/target/release/bundle
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: luma-windows-installer
-          path: examples/image-notes/.revenant/target/release/bundle/nsis/*.exe
+          path: examples/image-notes/.revenant/target/release/bundle
           if-no-files-found: error
           retention-days: 14

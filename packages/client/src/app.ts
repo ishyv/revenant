@@ -5,6 +5,7 @@ import type {
   OperationDefinition,
   RuntimeError,
   FileEntry,
+  Handle,
 } from "./contracts.js";
 import { Collection } from "./collection.js";
 import { Files } from "./files.js";
@@ -84,8 +85,13 @@ export class App<Checksum = unknown, Metadata = unknown> {
     return new Collection(this.scope, items);
   }
 
+  /** Release a native resource owner. Captured task leases remain valid until their tasks end or are disposed. */
+  async releaseResource(handle: Handle): Promise<void> {
+    await this.scope.request({ action: "resource.release", handle });
+  }
+
   /** Bind by id, resolving its compiled schema automatically once the root connects. */
-  operation<I, O>(id: string): Operation<I, O> {
+  operation<I, O, U = never>(id: string): Operation<I, O, U> {
     this.scope.assert();
     const definition = this.shared.manifest?.operations.find(
       (operation) => operation.id === id,
@@ -104,7 +110,7 @@ export class App<Checksum = unknown, Metadata = unknown> {
   }
 
   /** Bind a generated registration now; validate against the connected host before execution. */
-  bindOperation<I, O>(definition: OperationDefinition): Operation<I, O> {
+  bindOperation<I, O, U = never>(definition: OperationDefinition): Operation<I, O, U> {
     this.scope.assert();
     return new Operation(definition, this.scope, async () => {
       const manifest = await this.ready;
@@ -126,7 +132,7 @@ export class App<Checksum = unknown, Metadata = unknown> {
     this.scope.assert();
     return new App<Checksum, Metadata>(this.scope.child(), this.shared);
   }
-  /** Cleanup failures for this scope. */
+  /** Newest 64 cleanup failures for this scope; live subscribers observe every reported failure. */
   get cleanupErrors(): Scope["cleanupErrors"] {
     return this.scope.cleanupErrors;
   }

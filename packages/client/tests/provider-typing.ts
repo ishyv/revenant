@@ -1,4 +1,4 @@
-import type { App, FileEntry, OperationDefinition, OperationInput, OperationOutput, ProviderDescriptor, Query, Task } from '../src/index.js';
+import type { App, FileEntry, OperationDefinition, OperationInput, OperationOutput, OperationUpdates, ProviderDescriptor, Query, Task } from '../src/index.js';
 import { useApp } from '../src/svelte.js';
 
 type Input = { text: string };
@@ -45,3 +45,16 @@ const childChecksum: Promise<Checksum> = child.files.checksum.call(entry);
 const scoped = useApp(compiledApp);
 const scopedMetadata: Promise<Metadata> = scoped.media.readMetadata.call(entry);
 void [result, task, checksum, metadata, childChecksum, scopedMetadata];
+
+type ScanUpdate = { discovered: string };
+const scanning = app.bindOperation<Input, Output, ScanUpdate>(registration);
+const scanningTask: Task<Output, ScanUpdate> = scanning.run({ text: 'scan' });
+const scanUpdate: OperationUpdates<typeof scanning> = { discovered: '9007199254740993' };
+scanningTask.updates.subscribe(value => {
+  if (value) { const count: string = value.discovered; void count; }
+});
+// @ts-expect-error Application updates preserve compiled Rust field representations.
+const wrongUpdate: OperationUpdates<typeof scanning> = { discovered: 1 };
+// @ts-expect-error Application updates cannot be replaced by frontend code.
+scanningTask.updates.set(scanUpdate);
+void [scanUpdate, wrongUpdate];

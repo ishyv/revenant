@@ -1,5 +1,5 @@
 //! Ordinary records share the same typed operation model as file capabilities.
-use revenant::{Result, TaskContext, contract, operation};
+use revenant::{contract, operation};
 
 /// A small application record. Identity and completion survive normalization.
 #[contract]
@@ -14,13 +14,12 @@ pub struct Record {
 
 /// Trim and uppercase a record title while preserving its identity and status.
 ///
-/// This custom operation demonstrates handwritten Rust composition. File
+/// This ordinary function is discovered automatically by `revenant::app!`. File
 /// checksums use the host's built-in `files.checksum` registration instead.
-#[operation(id = "records.normalize")]
-pub async fn normalize(input: Record, context: TaskContext) -> Result<Record> {
-    context.checkpoint()?;
-    Ok(Record {
-        title: input.title.trim().to_uppercase(),
-        ..input
-    })
+#[operation(id = "records.normalize", read_only, independent)]
+pub fn normalize(record: Record) -> Record {
+    Record {
+        title: record.title.trim().to_uppercase(),
+        ..record
+    }
 }

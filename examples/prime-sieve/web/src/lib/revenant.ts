@@ -1,3 +1,3 @@
 // Generated from compiled Rust; do not edit.
-export * from './.revenant/ddac734f45e57ddfdc0007a37281e42c224233a6a8e1c09d3e9b82e4abab1e3e/facade';
-export { default } from './.revenant/ddac734f45e57ddfdc0007a37281e42c224233a6a8e1c09d3e9b82e4abab1e3e/facade';
+export * from './.revenant/11f3395a7d2d2361577c4814eac35b1680c01034118a2e242406bea76e5f5920/facade.ts';
+export { default } from './.revenant/11f3395a7d2d2361577c4814eac35b1680c01034118a2e242406bea76e5f5920/facade.ts';

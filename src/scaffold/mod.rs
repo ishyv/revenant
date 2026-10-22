@@ -3,7 +3,9 @@
 //! The native library is detected from `native/Cargo.toml`; its package name may
 //! differ from the application name. It must export `app() -> Application` and
 //! depend on the same SDK source as the generated host.
+mod assets;
 pub mod sdk;
+mod security;
 pub mod templates;
 mod zed;
 
@@ -37,24 +39,23 @@ pub fn create_project(root: &Path, name: &str) -> Result<()> {
 /// Generate only framework-owned files, preserving native source and frontend.
 /// SDK snapshots already present in the app are preserved, including local edits.
 pub fn prepare_host(root: &Path, config: &RevenantConfig) -> Result<PathBuf> {
-    if !root.join(".revenant/sdk/Cargo.toml").is_file() {
-        sdk::materialize(root)?;
-    }
-    let sdk_manifest = root.join(".revenant/sdk/crates/revenant-sdk/Cargo.toml");
-    let snapshot: toml::Value = toml::from_str(&std::fs::read_to_string(&sdk_manifest).context(
-        "SDK snapshot is incomplete; move .revenant/sdk aside and rerun with Revenant 0.3",
-    )?)?;
-    anyhow::ensure!(
-        snapshot
-            .get("package")
-            .and_then(|p| p.get("version"))
-            .and_then(toml::Value::as_str)
-            == Some("0.3.0")
-            && root
-                .join(".revenant/sdk/crates/revenant-desktop/Cargo.toml")
-                .is_file(),
-        "SDK snapshot predates desktop 0.3; move .revenant/sdk aside and rerun. Existing author files and generated facade are preserved."
-    );
+    sdk::ensure_sources(root)?;
+    // An installed client is a distinct snapshot, including npm's copied file
+    // dependencies. Reject it before touching host files; first installs follow.
+    sdk::check_installed_client(root, false)?;
+    let icons = assets::resolve(root, config.desktop.icons.as_deref())?;
+    let windows_icon = if icons.is_empty() {
+        Some("icons/icon.ico".to_owned())
+    } else {
+        icons
+            .iter()
+            .find(|(path, _)| {
+                Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("ico"))
+            })
+            .map(|(path, _)| path.clone())
+    };
     let host = root.join(".revenant/desktop");
     std::fs::create_dir_all(host.join("src"))?;
     let native_manifest = root.join("native/Cargo.toml");
@@ -85,11 +86,36 @@ pub fn prepare_host(root: &Path, config: &RevenantConfig) -> Result<PathBuf> {
         ("revenant::Application::new()", String::new())
     };
     let app_id = serde_json::to_string(&config.identifier())?;
+    let agents_enabled = config.agents.enabled.to_string();
+    let native_surfaces = config.desktop.native_surfaces.to_string();
+    let desktop_features = if config.desktop.native_surfaces {
+        "\"native-surfaces\""
+    } else {
+        ""
+    };
+    let fingerprint = crate::inspection::latest_build_source_fingerprint(root)?;
+    let source_fingerprint = fingerprint
+        .map(|value| serde_json::to_string(&value).map(|value| format!("Some({value}.into())")))
+        .transpose()?
+        .unwrap_or_else(|| "None".into());
+    let build_attempt = crate::inspection::ProjectInspector::open(root)
+        .ok()
+        .and_then(|inspector| inspector.build_attempt().ok())
+        .and_then(|attempt| attempt["id"].as_str().map(String::from))
+        .map(|id| serde_json::to_string(&id).map(|id| format!("Some({id}.into())")))
+        .transpose()?
+        .unwrap_or_else(|| "None".into());
     let tokens = [
         ("project_name", config.project.name.as_str()),
+        ("application_version", config.application_version()),
         ("application", application),
         ("native_dependency", dependency.as_str()),
         ("app_id", app_id.as_str()),
+        ("agents_enabled", agents_enabled.as_str()),
+        ("native_surfaces", native_surfaces.as_str()),
+        ("desktop_features", desktop_features),
+        ("source_fingerprint", source_fingerprint.as_str()),
+        ("build_attempt", build_attempt.as_str()),
     ];
     for (relative, template) in [
         ("Cargo.toml", templates::HOST_CARGO),
@@ -106,10 +132,13 @@ pub fn prepare_host(root: &Path, config: &RevenantConfig) -> Result<PathBuf> {
         std::fs::create_dir_all(path.parent().context("host asset parent")?)?;
         write_if_changed(&path, bytes)?;
     }
+    for (relative, bytes) in &icons {
+        write_if_changed(&host.join(relative), bytes)?;
+    }
     let conf = serde_json::json!({
         "$schema": "https://schema.tauri.app/config/2",
         "productName": config.project.name,
-        "version": "0.3.0",
+        "version": config.application_version(),
         "identifier": config.identifier(),
         "build": {
             "frontendDist": "../../build/web",
@@ -120,19 +149,23 @@ pub fn prepare_host(root: &Path, config: &RevenantConfig) -> Result<PathBuf> {
             "windows": [{"label": "main", "title": config.desktop.title.as_ref().unwrap_or(&config.project.name),
                 "width": config.desktop.width, "height": config.desktop.height}],
             "security": {
-                "csp": null,
+                "csp": security::policy(config, false),
+                "devCsp": security::policy(config, true),
                 // Revenant's async confirmation uses the current message command.
                 // Folder selection still runs through Revenant's scoped file API.
                 "capabilities": [{
                     "identifier": "desktop-confirmation",
                     "windows": ["main"],
-                    "permissions": ["dialog:allow-message"]
+                    "permissions": ["dialog:allow-message", "core:event:allow-listen",
+                        "core:event:allow-unlisten", "core:window:allow-destroy"]
                 }]
             }
         },
         "bundle": {"active": true, "targets": if cfg!(windows) { serde_json::json!(["nsis"]) } else { serde_json::json!("all") },
-            "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
-            "windows": {"webviewInstallMode": {"type": "offlineInstaller"}}}
+            "icon": if icons.is_empty() { vec!["icons/icon.png".to_owned(), "icons/icon.ico".to_owned(), "icons/icon.icns".to_owned()] }
+                else { icons.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>() },
+            "windows": {"webviewInstallMode": {"type": "offlineInstaller"},
+                "nsis": {"installerIcon": windows_icon, "uninstallerIcon": windows_icon}}}
     });
     write_if_changed(
         &host.join("tauri.conf.json"),

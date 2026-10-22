@@ -31,12 +31,13 @@ export function nativeError(code, message = code, retryable = false) {
 
 const definition = (id, input, output) => ({
   id, description: `Compiled fixture operation ${id}`,
+  arguments: ['value'], effect: 'readOnly', independent: false, agent: false,
   input: { name: 'Input', typescript: 'unknown', schema: input },
   output: { name: 'Output', typescript: 'unknown', schema: output },
   source: { file: 'native/fixture.rs', line: 12, module: 'fixture' },
 });
 export const manifest = {
-  version: 3, protocol: 2, digest: `sha256:${'a'.repeat(64)}`,
+  version: 6, protocol: 5, digest: `sha256:${'a'.repeat(64)}`,
   operations: [
     definition('records.echo', {
       type: 'object', additionalProperties: false,
@@ -64,6 +65,7 @@ export class NativeHost {
   allGates = new Set();
   names = ['alpha.txt', 'beta.txt', 'gamma.txt'];
   streamQueryBeforeReply = false;
+  refreshState = 'ready';
   cancelledPicker = false;
   maxPageOwners = 0;
   nextId = 0;
@@ -130,20 +132,32 @@ export class NativeHost {
         return descriptor;
       }
       case 'folder.query':
-      case 'view.query': {
-        const folder = action === 'view.query' ? this.views.get(request.view).folder : request.folder;
+      case 'view.query':
+      case 'view.refresh': {
+        const previous = this.views.get(request.view);
+        const folder = previous ? previous.folder : request.folder;
         assert.equal(this.folders.get(folder).scope, scope);
+        const owner = this.folders.get(folder);
+        const fresh = () => ({ names: [...this.names], state: action === 'view.refresh' ? this.refreshState : 'ready', generation: 1 });
+        const inventory = action === 'view.refresh' ? fresh() : previous ?
+          (!!previous.options?.recursive === !!request.options?.recursive ? previous.inventory : fresh()) :
+          (owner.inventory ??= fresh());
         const id = this.id('view');
         const view = {
           id, scope, folder, generation: request.generation, revision: 0,
-          indexGeneration: 1, options: request.options, offset: request.offset,
-          limit: request.limit, names: this.filteredNames(request.options),
-          state: 'ready', current: [], prior: [], outstanding: false, updates,
+          inventory, indexGeneration: inventory.generation, options: request.options, offset: request.offset,
+          limit: request.limit, names: this.filteredNames(request.options, inventory.names),
+          state: inventory.state, current: [], prior: [], outstanding: false, updates,
         };
         this.views.set(id, view);
         const snapshot = this.offer(view);
         if (this.streamQueryBeforeReply) updates?.(structuredClone(snapshot));
         return { view: id, snapshot };
+      }
+      case 'view.cancel': {
+        const view = this.views.get(request.view);
+        if (view) view.inventory.cancelled = true;
+        return null;
       }
       case 'view.window': {
         const view = this.views.get(request.view);
@@ -155,7 +169,7 @@ export class NativeHost {
       }
       case 'view.ack': {
         const view = this.views.get(request.view);
-        assert.ok(view, 'Received page must be ACKed before native view disposal');
+        if (!view) throw nativeError('view_disposed', 'File view has been disposed');
         if (request.revision !== view.revision) return null;
         for (const entry of view.prior) this.resources.delete(entry.handle.id);
         view.prior = [];
@@ -257,8 +271,8 @@ export class NativeHost {
     }
   }
 
-  filteredNames(options = {}) {
-    const names = this.names.filter(name => name.includes(options.search ?? '')).sort();
+  filteredNames(options = {}, inventory = this.names) {
+    const names = inventory.filter(name => name.includes(options.search ?? '')).sort();
     return options.descending ? names.reverse() : names;
   }
   offer(view) {
@@ -284,9 +298,14 @@ export class NativeHost {
   }
   scan(viewId, names, state = 'loading') {
     const view = this.views.get(viewId);
-    Object.assign(view, { names: [...names], state, indexGeneration: view.indexGeneration + 1 });
-    if (view.outstanding) { view.dirty = true; return; }
-    view.updates?.(structuredClone(this.offer(view)));
+    Object.assign(view.inventory, { names: [...names], state, generation: view.inventory.generation + 1 });
+    for (const current of this.views.values()) {
+      if (current.inventory !== view.inventory) continue;
+      Object.assign(current, { names: this.filteredNames(current.options, names), state,
+        indexGeneration: view.inventory.generation });
+      if (current.outstanding) current.dirty = true;
+      else current.updates?.(structuredClone(this.offer(current)));
+    }
   }
   complete(taskId, { state = 'succeeded', result, rows = [] } = {}) {
     const task = this.tasks.get(taskId);

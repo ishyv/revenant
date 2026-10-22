@@ -17,20 +17,20 @@ export interface QuerySnapshot<O> {
 }
 
 /** Scope-owned readable for replaceable reads. Mutations should use explicit operation calls. */
-export class Query<I, O> implements Readable<QuerySnapshot<O>> {
+export class Query<I, O, U = never> implements Readable<QuerySnapshot<O>> {
   private store = new Signal<QuerySnapshot<O>>({ status: "idle" });
   private generation = 0;
   private closed = false;
-  private active?: Task<O>;
+  private active?: Task<O, U>;
   private releases = new Set<Promise<void>>();
-  private taskCleanup = new WeakMap<Task<O>, Promise<void>>();
+  private taskCleanup = new WeakMap<Task<O, U>, Promise<void>>();
   private cleanup?: Promise<void>;
 
   /** Observe query state using the standard Svelte readable-store interface. */
   readonly subscribe = this.store.subscribe;
 
   /** Register this read projection with the operation's native scope. */
-  constructor(private operation: Operation<I, O>) {
+  constructor(private operation: Operation<I, O, U>) {
     operation.owner.own(this);
   }
 
@@ -47,7 +47,7 @@ export class Query<I, O> implements Readable<QuerySnapshot<O>> {
 
     // A synchronous subscriber may replace this load or dispose the scope.
     if (!this.current(version)) return;
-    let task: Task<O> | undefined;
+    let task: Task<O, U> | undefined;
     try {
       task = this.operation.run(input);
       // The query takes ownership so a closing scope cannot report a task's
@@ -101,12 +101,11 @@ export class Query<I, O> implements Readable<QuerySnapshot<O>> {
     return version;
   }
 
-  private release(task: Task<O>): Promise<void> {
+  private release(task: Task<O, U>): Promise<void> {
     const existing = this.taskCleanup.get(task);
     if (existing) return existing;
     const pending = task.dispose().catch((error) => {
-      const errors = this.operation.owner.cleanupErrors;
-      errors.set([...errors.current, errorOf(error, "cleanup_failed")]);
+      this.operation.owner.reportCleanup(error);
     }).finally(() => this.releases.delete(pending));
     this.releases.add(pending);
     this.taskCleanup.set(task, pending);

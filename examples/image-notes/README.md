@@ -33,6 +33,18 @@ genera los tipos desde el contrato Rust. Los siguientes arranques reutilizan el
 catálogo y la caché. El frontend necesita el host Tauri: abrir solo Vite en un
 navegador no proporciona las capacidades nativas.
 
+La caché de imágenes tiene un presupuesto de **512 MiB**. Luma elimina
+versiones obsoletas y después las menos utilizadas, coordinando los procesos
+mediante un bloqueo del sistema operativo. La barra muestra su uso y permite
+limpiarla; las imágenes se regeneran al abrirlas. Las notas, el catálogo y los
+originales se conservan. Los archivos no reconocidos se preservan y cuentan
+dentro del presupuesto; si impiden guardar una nueva imagen en caché, se
+devuelve la imagen sin guardarla y se informa del motivo.
+
+Al cerrar con cambios pendientes, elige **Guardar / Descartar / Cancelar**.
+Guardar espera también las ediciones hechas durante la escritura. Una
+cancelación o un fallo de guardado conserva la ventana y el borrador.
+
 La rama incluye el workflow **Luma Windows app**. Una ejecución correcta publica
 el artifact **luma-windows-installer**, con un instalador `.exe`, durante 14 días.
 Puedes descargarlo desde la ejecución en GitHub Actions y probar sin instalar

@@ -15,6 +15,48 @@ use std::{collections::BTreeMap, sync::Arc};
 #[doc(hidden)]
 pub type OperationFactory = fn() -> Result<OperationRegistration>;
 
+/// Linker registration identity emitted by the operation attribute.
+#[doc(hidden)]
+pub struct OperationDiscovery {
+    /// Origin package; dependencies require explicit composition.
+    pub package: &'static str,
+    /// Origin module path, whose first segment identifies the actual compiled crate.
+    pub module: &'static str,
+    /// Stable source ordering key independent of linker section ordering.
+    pub source: &'static str,
+    /// Deferred executor and contract construction.
+    pub factory: OperationFactory,
+}
+
+/// Distributed operation registrations, filtered by the calling application's origin.
+#[doc(hidden)]
+#[linkme::distributed_slice]
+pub static OPERATION_DISCOVERY: [OperationDiscovery];
+
+/// Builds a default dotted identifier from the module path and camelCase function name.
+#[doc(hidden)]
+pub fn inferred_operation_id(module: &str, function: &str) -> String {
+    let mut segments = module
+        .split("::")
+        .skip(1)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut name = String::new();
+    let mut upper = false;
+    for character in function.trim_start_matches("r#").chars() {
+        if character == '_' {
+            upper = !name.is_empty();
+        } else if upper {
+            name.extend(character.to_uppercase());
+            upper = false;
+        } else {
+            name.push(character);
+        }
+    }
+    segments.push(name);
+    segments.join(".")
+}
+
 /// A native capability and its initial, schema-validated configuration.
 pub struct CapabilityDefinition {
     /// Compiled implementation prepared only when the application starts.
@@ -45,6 +87,25 @@ impl Application {
     /// Creates a definition with the standard desktop capabilities.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Adds annotated functions from the calling application crate.
+    ///
+    /// Used by [`crate::app!`]. Dependency operations remain explicit; a package's
+    /// separate binary or test crate cannot accidentally discover its library operations.
+    #[doc(hidden)]
+    pub fn discover(mut self, package: &str, module: &str) -> Self {
+        let crate_name = module.split("::").next();
+        let mut operations: Vec<_> = OPERATION_DISCOVERY
+            .iter()
+            .filter(|operation| {
+                operation.package == package && operation.module.split("::").next() == crate_name
+            })
+            .collect();
+        operations.sort_by_key(|operation| operation.source);
+        self.operations
+            .extend(operations.into_iter().map(|operation| operation.factory));
+        self
     }
 
     /// Adds operations using their ordinary Rust function paths.
@@ -101,13 +162,15 @@ impl Application {
 
     /// Host-only access to the inert composition, after manifest validation.
     #[doc(hidden)]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<OperationFactory>,
-        Vec<CapabilityDefinition>,
-        BTreeMap<String, Arc<dyn Fn() -> Arc<dyn Provider> + Send + Sync>>,
-    ) {
+    pub fn into_parts(self) -> ApplicationParts {
         (self.operations, self.capabilities, self.replacements)
     }
 }
+
+/// Inert composition consumed by the host after contract validation.
+#[doc(hidden)]
+pub type ApplicationParts = (
+    Vec<OperationFactory>,
+    Vec<CapabilityDefinition>,
+    BTreeMap<String, Arc<dyn Fn() -> Arc<dyn Provider> + Send + Sync>>,
+);

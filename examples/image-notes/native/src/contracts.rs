@@ -1,10 +1,6 @@
 //! JSON contracts shared by operation adapters and native services.
 //! Catalog IDs persist across refreshes; none of these types carry scoped file handles.
-use revenant::contract;
-
-/// Empty input for loading persisted catalog information.
-#[contract]
-pub struct Empty {}
+use revenant::{DecimalU64, contract};
 
 /// One folder registered by the user. Paths are restored from the native catalog.
 #[contract]
@@ -28,13 +24,6 @@ pub struct Bootstrap {
     pub roots: Vec<Root>,
     /// Native application data directory, for backup and troubleshooting.
     pub data_path: String,
-}
-
-/// Explicitly selected folder to add or refresh.
-#[contract]
-pub struct ScanInput {
-    /// Location returned by the native folder picker or an existing root record.
-    pub path: String,
 }
 
 /// Completed scan summary. Cancelled scans preserve existing annotations.
@@ -131,6 +120,41 @@ pub struct Rendition {
     pub width: u32,
     /// Display rendition height in pixels.
     pub height: u32,
+    /// Explanation when preserved unrecognized cache files prevented disk caching.
+    /// The returned image remains usable; clearing removes only Luma-owned files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_warning: Option<String>,
+}
+
+/// Current rendition payload usage. Cache metadata and the OS lease are excluded.
+/// Unrecognized files count toward the budget and are preserved by every cleanup.
+#[contract]
+#[serde(rename_all = "camelCase")]
+pub struct CacheUsage {
+    /// Total payload bytes as a decimal string, including preserved unrecognized files.
+    pub bytes: DecimalU64,
+    /// Payload bytes explicitly owned by the rendition index.
+    pub managed_bytes: DecimalU64,
+    /// Preserved legacy or unrecognized payload bytes.
+    pub unmanaged_bytes: DecimalU64,
+    /// Existing owned rendition files.
+    pub entries: u32,
+    /// Luma's rendition payload budget: 512 MiB.
+    pub budget_bytes: DecimalU64,
+    /// Unrecognized files consume the entire budget; new renditions will be uncached.
+    pub publication_blocked: bool,
+}
+
+/// Result of clearing owned renditions. Originals, catalog records and notes are retained.
+#[contract]
+#[serde(rename_all = "camelCase")]
+pub struct ClearedCache {
+    /// Actual payload bytes removed from disk.
+    pub removed_bytes: DecimalU64,
+    /// Owned index entries removed, including missing files.
+    pub removed_entries: u32,
+    /// Measured usage after cleanup, including preserved unrecognized files.
+    pub usage: CacheUsage,
 }
 
 /// Remove a folder from the catalog after explicit UI confirmation.

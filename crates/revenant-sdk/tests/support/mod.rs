@@ -53,8 +53,8 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
 pub fn fresh_task(task_id: &str) -> (ResourceRegistry, TaskManager, TaskContext) {
     let resources = ResourceRegistry::new();
-    resources.create_scope("test-scope", None).unwrap();
+    let scope = resources.create_scope(None).unwrap();
     let tasks = TaskManager::new(resources.clone());
-    let context = tasks.create("test-scope", task_id).unwrap();
+    let context = tasks.create(&scope, task_id).unwrap();
     (resources, tasks, context)
 }

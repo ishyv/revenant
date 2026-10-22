@@ -5,8 +5,8 @@ use std::{fs, path::Path};
 use tempfile::TempDir;
 
 fn manifest(description: &str) -> Value {
-    json!({"version":3,"protocol":2,"digest":format!("sha256:{}", "a".repeat(64)),"operations":[{
-        "id":"records.normalize","description":description,
+    json!({"version":6,"protocol":5,"digest":format!("sha256:{}", "a".repeat(64)),"operations":[{
+        "id":"records.normalize","description":description,"arguments":["title"],"effect":"readOnly","independent":false,"agent":false,
         "source":{"file":"src/records.rs","line":17,"module":"custom_native::records"},
         "input":{"schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"]},"typescript":"/** A title to normalize. */\nexport type ContractValue = Record;\nexport type Record = { /** Human-readable title. */ title: string };"},
         "output":{"schema":{"type":"string"},"typescript":"export type ContractValue = string;"}
@@ -20,8 +20,46 @@ fn export(root: &Path, value: &Value) {
     .unwrap();
 }
 fn publish(root: &Path) -> String {
+    if !root.join(".revenant/sdk").exists() {
+        revenant::scaffold::sdk::materialize(root).unwrap();
+        fn copy_directory(source: &Path, destination: &Path) {
+            fs::create_dir_all(destination).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_directory(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        copy_directory(
+            &root.join(".revenant/sdk/packages/client"),
+            &root.join("web/node_modules/@revenant/client"),
+        );
+    }
     let stage = BuildStage::new(root).unwrap();
     stage.publish(common::fixture(), false).unwrap()
+}
+
+#[test]
+fn stale_installed_client_cannot_allocate_or_publish_a_contract_generation() {
+    let temp = TempDir::new().unwrap();
+    export(temp.path(), &manifest("last successful contract"));
+    publish(temp.path());
+    let entry = temp.path().join("web/src/lib/revenant.ts");
+    let before = fs::read(&entry).unwrap();
+    let stage = BuildStage::new(temp.path()).unwrap();
+    fs::write(
+        temp.path().join("web/node_modules/@revenant/client/src/svelte.ts"),
+        "// same package version, but setupApp is absent\nexport function provideApp() {}\nexport function useApp() {}\n",
+    ).unwrap();
+    assert!(BuildStage::new(temp.path()).is_err());
+    assert!(stage.publish(common::fixture(), false).is_err());
+    assert_eq!(fs::read(entry).unwrap(), before);
+    drop(stage);
+    no_unpublished_stages(temp.path());
 }
 fn no_unpublished_stages(root: &Path) {
     for item in fs::read_dir(root.join("web/src/lib/.revenant")).unwrap() {
@@ -33,6 +71,51 @@ fn no_unpublished_stages(root: &Path) {
                 .starts_with(".stage-")
         );
     }
+}
+
+#[test]
+fn imported_callable_types_do_not_collide_with_operation_namespaces() {
+    let temp = TempDir::new().unwrap();
+    let mut value = manifest("callable type collision");
+    value["operations"][0]["id"] = json!("operationFunction");
+    let mut read = value["operations"][0].clone();
+    read["id"] = json!("readOperationFunction");
+    value["operations"].as_array_mut().unwrap().push(read);
+    export(temp.path(), &value);
+    let generation = publish(temp.path());
+    let facade = fs::read_to_string(
+        temp.path()
+            .join("web/src/lib/.revenant")
+            .join(generation)
+            .join("facade.ts"),
+    )
+    .unwrap();
+    assert!(!facade.contains("export namespace OperationFunction {"));
+    assert!(!facade.contains("export namespace ReadOperationFunction {"));
+    assert!(facade.contains("export namespace OperationFunction_"));
+    assert!(facade.contains("export namespace ReadOperationFunction_"));
+}
+
+#[test]
+fn operation_updates_generate_rust_dto_namespace_and_typed_task_bindings() {
+    let temp = TempDir::new().unwrap();
+    let mut value = manifest("Typed live scan data");
+    value["operations"][0]["updates"] = json!({
+        "schema":{"type":"object","properties":{"count":{"type":"integer","minimum":0,"maximum":4294967295_u64}},"required":["count"]},
+        "typescript":"export type ContractValue = ScanUpdate;\nexport type ScanUpdate = { count: number };"
+    });
+    export(temp.path(), &value);
+    let generation = publish(temp.path());
+    let facade = fs::read_to_string(
+        temp.path()
+            .join("web/src/lib/.revenant")
+            .join(generation)
+            .join("facade.ts"),
+    )
+    .unwrap();
+    assert!(facade.contains("export namespace Updates"));
+    assert!(facade.contains("Operation<RecordsNormalize.Input.ContractValue, RecordsNormalize.Output.ContractValue, RecordsNormalize.Updates.ContractValue>"));
+    assert!(facade.contains("ReadOperationFunction<RecordsNormalize.Input.ContractValue, RecordsNormalize.Output.ContractValue, RecordsNormalize.Updates.ContractValue>"));
 }
 
 #[test]
@@ -48,6 +131,9 @@ fn immutable_generation_publishes_documented_types_and_rust_source() {
     let facade = String::from_utf8(before.clone()).unwrap();
     assert!(facade.contains("export namespace RecordsNormalize"));
     assert!(facade.contains("export function setupApp("));
+    assert!(facade.contains("export function useOperations("));
+    assert!(facade.contains("ReadOperationFunction<RecordsNormalize.Input.ContractValue, RecordsNormalize.Output.ContractValue>"));
+    assert!(facade.contains("callableOperation(runtime.bindOperation<"));
     assert!(facade.contains("setupRuntimeApp(createApp(options))"));
     // TypeScript treats a same-line `{ /**` as a trailing comment rather than
     // documentation for the following operation property.
@@ -85,6 +171,38 @@ fn immutable_generation_publishes_documented_types_and_rust_source() {
 }
 
 #[test]
+fn publication_uses_captured_source_identity_when_a_later_attempt_replaces_state() {
+    let temp = TempDir::new().unwrap();
+    export(temp.path(), &manifest("captured source"));
+    publish(temp.path());
+    let stage = BuildStage::new_with_source_identity(
+        temp.path(),
+        Some("sha256:captured".into()),
+        Some("attempt-first".into()),
+    )
+    .unwrap();
+    fs::create_dir_all(temp.path().join(".revenant/inspection")).unwrap();
+    fs::write(
+        temp.path().join(".revenant/inspection/build.json"),
+        r#"{"sourceFingerprint":{"digest":"sha256:later"},"id":"attempt-later"}"#,
+    )
+    .unwrap();
+    let generation = stage.publish(common::fixture(), false).unwrap();
+    let metadata: Value = serde_json::from_slice(
+        &fs::read(
+            temp.path()
+                .join("web/src/lib/.revenant")
+                .join(generation)
+                .join("generation.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["sourceFingerprint"], "sha256:captured");
+    assert_eq!(metadata["buildAttempt"], "attempt-first");
+}
+
+#[test]
 fn failed_export_or_invalid_manifest_preserves_last_success_and_cleans_staging() {
     let temp = TempDir::new().unwrap();
     export(temp.path(), &manifest("last success"));
@@ -98,6 +216,10 @@ fn failed_export_or_invalid_manifest_preserves_last_success_and_cleans_staging()
     }
     fs::remove_file(temp.path().join("fixture-export-fails")).unwrap();
     let mut cases = vec![];
+    let mut previous_contract = manifest("previous ownership protocol");
+    previous_contract["version"] = json!(5);
+    previous_contract["protocol"] = json!(4);
+    cases.push(previous_contract);
     let mut wrong_protocol = manifest("invalid");
     wrong_protocol["protocol"] = json!(1);
     cases.push(wrong_protocol);
@@ -166,4 +288,40 @@ fn builtins_extend_capabilities_and_scopes_keep_typed_aliases() {
     assert!(facade.contains(
         "Operation<FilesChecksum.Input.ContractValue, FilesChecksum.Output.ContractValue>"
     ));
+}
+
+#[test]
+fn generated_operations_preserve_explicit_owner_and_component_default() {
+    // Keep the disposable app beneath the installed test prerequisites so its
+    // real SDK copy can resolve dependencies without mocking facade imports.
+    let client = Path::new(env!("CARGO_MANIFEST_DIR")).join("packages/client");
+    let temp = TempDir::new_in(&client).unwrap();
+    let mut value = manifest("Scope binding regression");
+    value["operations"][0]["input"]["name"] = json!("Input");
+    value["operations"][0]["output"]["name"] = json!("Output");
+    export(temp.path(), &value);
+    let generation = publish(temp.path());
+    let facade = temp
+        .path()
+        .join("web/src/lib/.revenant")
+        .join(generation)
+        .join("facade.ts");
+    let output = std::process::Command::new("node")
+        .current_dir(client)
+        .args([
+            "--conditions=browser",
+            "--conditions=svelte",
+            "--import",
+            "tsx",
+            "tests/fixtures/generated-owner-check.mjs",
+        ])
+        .arg(facade)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated owner regression:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

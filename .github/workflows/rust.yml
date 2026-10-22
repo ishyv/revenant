@@ -5,9 +5,11 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   windows:
@@ -17,11 +19,23 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify source checkout
+        run: |
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Unexpected source checkout' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Python correctness and Windows process ownership
+        run: |
+          python -m unittest discover -s scripts/tests -p 'test_benchmark_*.py'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Compile desktop workspace
         run: |
           cargo fmt --all -- --check
@@ -32,14 +46,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Public Rust documentation
         env:
-          RUSTDOCFLAGS: '-D missing_docs -D rustdoc::broken_intra_doc_links'
+          RUSTDOCFLAGS: '-D missing_docs -D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags'
         run: |
-          cargo doc -p revenant-core -p revenant-sdk -p revenant-macros -p revenant-desktop --all-features --no-deps --locked
+          cargo doc -p revenant-core -p revenant-sdk -p revenant-macros -p revenant-desktop -p revenant-agent -p revenant-graphics --all-features --no-deps --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Install client dependencies
         working-directory: packages/client
         run: |
-          npm install
+          npm ci --install-links
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Frontend and API documentation
         run: |
@@ -57,14 +71,30 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm test --prefix packages/client
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Build CLI
+          npm run test:ui --prefix packages/client
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node --test scripts/inspection-semantic.test.mjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node --test scripts/evaluate-agent-workflow.test.mjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Repeat Windows shadow lifecycle tests
         run: |
+          for ($iteration = 1; $iteration -le 10; $iteration++) {
+            Write-Host "Shadow lifecycle iteration $iteration/10"
+            cargo test -p revenant --test desktop_shadow --all-features --locked -- --nocapture
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Build CLI
+        # Discovery must survive optimization and dead-code elimination.
+        run: |
+          cargo test -p revenant-sdk --release --test authoring_04 --test discovery_duplicates --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build -p revenant --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build migrated reference applications
         run: |
           $cli = (Resolve-Path target/debug/revenant.exe).Path
-          foreach ($project in @('examples/file-media', 'examples/prime-sieve')) {
+          foreach ($project in @('examples/file-media', 'examples/prime-sieve', 'examples/native-workflows')) {
             Push-Location $project
             try {
               & $cli build
@@ -73,10 +103,16 @@ jobs:
               if ($LASTEXITCODE) { exit $LASTEXITCODE }
             } finally { Pop-Location }
           }
+      - name: Compare actual compiled contract validators
+        run: |
+          npm run check:contracts --prefix packages/client -- ../../examples/file-media ../../examples/prime-sieve ../../examples/native-workflows
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build standalone desktop scaffold
         run: |
           $cli = (Resolve-Path target/debug/revenant.exe).Path
-          Push-Location $env:RUNNER_TEMP
+          $outside = Join-Path $env:RUNNER_TEMP 'Revenant smoke café'
+          New-Item -ItemType Directory -Force -Path $outside | Out-Null
+          Push-Location $outside
           try {
             & $cli new standalone-app
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -88,6 +124,15 @@ jobs:
               if ($LASTEXITCODE) { exit $LASTEXITCODE }
             } finally { Pop-Location }
           } finally { Pop-Location }
+      - name: Verify installer artifacts and source provenance
+        run: |
+          foreach ($bundle in @('examples/file-media/.revenant/target/release/bundle', 'examples/prime-sieve/.revenant/target/release/bundle', 'examples/native-workflows/.revenant/target/release/bundle', "$env:RUNNER_TEMP/Revenant smoke café/standalone-app/.revenant/target/release/bundle")) {
+            if (-not (Get-ChildItem -LiteralPath "$bundle/nsis" -Filter '*.exe')) { throw "Missing NSIS installer: $bundle" }
+            node scripts/write-build-evidence.mjs $bundle
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            node scripts/write-build-evidence.mjs --verify $bundle
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -96,5 +141,6 @@ jobs:
             target/doc
             examples/file-media/.revenant/target/release/bundle
             examples/prime-sieve/.revenant/target/release/bundle
-            ${{ runner.temp }}/standalone-app/.revenant/target/release/bundle
+            examples/native-workflows/.revenant/target/release/bundle
+            ${{ runner.temp }}/Revenant smoke café/standalone-app/.revenant/target/release/bundle
           if-no-files-found: warn

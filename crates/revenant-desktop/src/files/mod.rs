@@ -272,34 +272,34 @@ impl FolderIndex {
         struct ScanGuard<'a>(&'a FolderIndex);
         impl Drop for ScanGuard<'_> {
             fn drop(&mut self) {
-                if let Ok(mut inner) = self.0.inner.lock() {
-                    if inner.status.state == IndexState::Scanning {
-                        inner.status.state = IndexState::Failed;
-                        inner.status.generation = inner.status.generation.saturating_add(1);
-                        inner.counts.clear();
-                        let _ = inner.db.connection.execute("DELETE FROM pending_dirs", []);
-                    }
+                if let Ok(mut inner) = self.0.inner.lock()
+                    && inner.status.state == IndexState::Scanning
+                {
+                    inner.status.state = IndexState::Failed;
+                    inner.status.generation = inner.status.generation.saturating_add(1);
+                    inner.counts.clear();
+                    let _ = inner.db.connection.execute("DELETE FROM pending_dirs", []);
                 }
                 self.0.scanning.store(false, Ordering::Release);
             }
         }
         let _guard = ScanGuard(self);
         let result = self.scan_inner(cancel, &notify);
-        if let Err(error) = &result {
-            if !error.is_cancelled() {
-                // Publish fatal failure after rolling back any failed chunk.
-                // The notification may query again, so release the lock first.
-                let status = {
-                    let mut inner = lock(&self.inner)?;
-                    inner.status.state = IndexState::Failed;
-                    inner.status.generation = inner.status.generation.saturating_add(1);
-                    inner.status.warnings.push(&self.root, error);
-                    inner.counts.clear();
-                    let _ = inner.db.connection.execute("DELETE FROM pending_dirs", []);
-                    inner.status.clone()
-                };
-                notify(status);
-            }
+        if let Err(error) = &result
+            && !error.is_cancelled()
+        {
+            // Publish fatal failure after rolling back any failed chunk.
+            // The notification may query again, so release the lock first.
+            let status = {
+                let mut inner = lock(&self.inner)?;
+                inner.status.state = IndexState::Failed;
+                inner.status.generation = inner.status.generation.saturating_add(1);
+                inner.status.warnings.push(&self.root, error);
+                inner.counts.clear();
+                let _ = inner.db.connection.execute("DELETE FROM pending_dirs", []);
+                inner.status.clone()
+            };
+            notify(status);
         }
         result
     }
@@ -777,11 +777,11 @@ impl Iterator for FileSelection {
         if self.stopped || self.position >= self.total {
             return None;
         }
-        if self.buffer.is_empty() {
-            if let Err(error) = self.refill() {
-                self.stopped = true;
-                return Some(Err(error));
-            }
+        if self.buffer.is_empty()
+            && let Err(error) = self.refill()
+        {
+            self.stopped = true;
+            return Some(Err(error));
         }
         match self.buffer.pop_front() {
             Some(file) => {
@@ -848,7 +848,7 @@ fn is_link(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        return metadata.file_attributes() & 0x400 != 0;
+        metadata.file_attributes() & 0x400 != 0
     }
     #[cfg(not(windows))]
     {

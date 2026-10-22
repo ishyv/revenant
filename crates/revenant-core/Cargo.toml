@@ -1,9 +1,17 @@
 [package]
 name = "revenant-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "Scoped capability ownership, task lifecycle, and wire contracts"
+
+[features]
+default = []
+experimental-compute = []
+
+[[example]]
+name = "compute_experiment"
+required-features = ["experimental-compute"]
 
 [dependencies]
 serde = { version = "1", features = ["derive", "rc"] }
@@ -11,4 +19,5 @@ serde_json = "1"
 schemars = "1.2"
 ts-rs = { version = "12", features = ["serde-json-impl"] }
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 jsonschema = { version = "0.33", default-features = false }

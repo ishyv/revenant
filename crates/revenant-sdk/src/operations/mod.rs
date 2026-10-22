@@ -4,8 +4,8 @@ mod prepared;
 mod registration;
 mod registry;
 
-pub(crate) use contracts::validate_registration;
-pub use contracts::{ContractManifest, OperationDescriptor, OperationSource};
+pub use contracts::{ContractManifest, OperationDescriptor, OperationEffect, OperationSource};
+pub(crate) use contracts::{ContractValidators, validate_registration};
 pub use prepared::PreparedOperation;
 pub use registration::{OperationExecutor, OperationFuture, OperationRegistration};
 pub use registry::{OperationRegistry, Registry};

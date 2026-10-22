@@ -39,12 +39,12 @@ fn register(registry: &ResourceRegistry, scope: &str) -> FileEntry {
 #[test]
 fn handles_are_scope_bound_and_stale_after_release() {
     let registry = ResourceRegistry::new();
-    registry.create_scope("owner", None).unwrap();
-    registry.create_scope("other", None).unwrap();
-    let entry = register(&registry, "owner");
+    let owner = registry.create_scope(None).unwrap();
+    let other = registry.create_scope(None).unwrap();
+    let entry = register(&registry, &owner);
 
     assert_eq!(
-        registry.validate("other", &entry.handle).unwrap_err().code,
+        registry.validate(&other, &entry.handle).unwrap_err().code,
         "scope_mismatch"
     );
 
@@ -52,19 +52,19 @@ fn handles_are_scope_bound_and_stale_after_release() {
     stale_generation.generation += 1;
     assert_eq!(
         registry
-            .validate("owner", &stale_generation)
+            .validate(&owner, &stale_generation)
             .unwrap_err()
             .code,
         "stale_handle"
     );
 
-    registry.release("owner", &entry.handle).unwrap();
+    registry.release(&owner, &entry.handle).unwrap();
     assert_eq!(
-        registry.validate("owner", &entry.handle).unwrap_err().code,
+        registry.validate(&owner, &entry.handle).unwrap_err().code,
         "stale_handle"
     );
     assert_eq!(
-        registry.release("owner", &entry.handle).unwrap_err().code,
+        registry.release(&owner, &entry.handle).unwrap_err().code,
         "stale_handle"
     );
 }
@@ -72,8 +72,8 @@ fn handles_are_scope_bound_and_stale_after_release() {
 #[test]
 fn resource_cleanup_waits_for_leases_after_release_or_scope_disposal() {
     let registry = ResourceRegistry::new();
-    registry.create_scope("released", None).unwrap();
-    registry.create_scope("disposed", None).unwrap();
+    let released = registry.create_scope(None).unwrap();
+    let disposed = registry.create_scope(None).unwrap();
 
     let released_cleanup = Arc::new(AtomicUsize::new(0));
     let released_cleanup_for_callback = released_cleanup.clone();
@@ -82,17 +82,15 @@ fn resource_cleanup_waits_for_leases_after_release_or_scope_disposal() {
     });
     let released_entry = registry
         .register_file_owned(
-            "released",
+            &released,
             metadata(),
             Arc::new(TestReader),
             Some("provider-release"),
             Some(released_hook),
         )
         .unwrap();
-    let released_lease = registry.lease("released", &released_entry.handle).unwrap();
-    registry
-        .release("released", &released_entry.handle)
-        .unwrap();
+    let released_lease = registry.lease(&released, &released_entry.handle).unwrap();
+    registry.release(&released, &released_entry.handle).unwrap();
     assert_eq!(registry.provider_resource_count("provider-release"), 1);
     assert_eq!(released_cleanup.load(Ordering::SeqCst), 0);
     drop(released_lease);
@@ -106,20 +104,20 @@ fn resource_cleanup_waits_for_leases_after_release_or_scope_disposal() {
     });
     let disposed_entry = registry
         .register_file_owned(
-            "disposed",
+            &disposed,
             metadata(),
             Arc::new(TestReader),
             Some("provider-dispose"),
             Some(disposed_hook),
         )
         .unwrap();
-    let disposed_lease = registry.lease("disposed", &disposed_entry.handle).unwrap();
+    let disposed_lease = registry.lease(&disposed, &disposed_entry.handle).unwrap();
 
-    registry.dispose_scope("disposed").unwrap();
-    assert!(!registry.is_scope_active("disposed"));
+    registry.dispose_scope(&disposed).unwrap();
+    assert!(!registry.is_scope_active(&disposed));
     assert_eq!(
         registry
-            .validate("disposed", &disposed_entry.handle)
+            .validate(&disposed, &disposed_entry.handle)
             .unwrap_err()
             .code,
         "scope_disposed"

@@ -84,10 +84,10 @@ my-app/
   .revenant/desktop/       # Generated Tauri host
 ```
 
-The generated facade exports `setupApp()` for the layout and `useApp()` for
-descendant components. A custom `native/` library exports
-`app() -> Application`; operation macros define the contracts used to generate
-the frontend API. Applications using only built-in capabilities need no
+The generated facade exports `setupApp()` for the layout, `useApp()` for
+native resources and `useOperations()` for directly callable Rust operations.
+A custom `native/` library uses `revenant::app!()` to discover annotated
+functions and generate their argument records and frontend types. Applications using only built-in capabilities need no
 handwritten Rust.
 
 Examples: [file/media](examples/file-media/README.md),
@@ -96,7 +96,7 @@ Examples: [file/media](examples/file-media/README.md),
 
 ## Architecture
 
-Revenant 0.3 uses Tauri for the desktop window and IPC. Rust owns filesystem
+Revenant 0.4 uses Tauri for the desktop window and IPC. Rust owns filesystem
 access, jobs, resource lifetimes, and persistence. Folder indexes, large
 selections, and batch results stay in native SQLite storage; the client reads
 bounded query and result pages. HyvUI is the default, replaceable UI layer.
@@ -109,6 +109,17 @@ and source metadata.
 The CLI embeds an SDK snapshot so generated apps can build independently of
 this checkout. Keep `.revenant/sdk/` with the application; host preparation
 preserves local SDK edits.
+
+`revenant sdk check` validates sources and the installed client independently.
+`revenant sdk upgrade` backs up the SDK, dependencies, lockfiles and contracts
+before replacing them; `revenant sdk restore <backup>` restores that state.
+See [SDK compatibility and recovery](docs/SDK.md) for the transaction boundary.
+
+`revenant inspect --json` reports source, generated bindings, builds and running
+instances. `revenant check --json` refreshes structured diagnostics.
+`revenant mcp --project <path>` exposes development inspection and semantic code
+queries. Apps can enable a separate live tool surface with `[agents] enabled = true`
+and explicit `#[operation(agent)]` annotations. See the [0.4 migration](docs/MIGRATION-0.4.md).
 
 Version 2 and unversioned WASM/HTTP configurations are rejected with migration
 instructions. Migration requires changes to the host, native library, and

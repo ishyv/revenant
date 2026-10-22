@@ -1,5 +1,5 @@
 /** Inspect an explicitly instrumented local WebView2 without changing the app.
- * Usage: node scripts/check-desktop-ui.mjs --port 9223 [--offline] [--reload]
+ * Usage: node scripts/check-desktop-ui.mjs --port 9223 [--offline] [--reload] [--security] [--close]
  * Offline emulation applies only to this debugger target, never system networking.
  */
 const args = process.argv.slice(2);
@@ -36,7 +36,7 @@ function send(method, params = {}) {
   });
 }
 async function evaluate(expression) {
-  const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+  const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true, allowUnsafeEvalBlockedByCSP: false });
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
   return result.result.value;
 }
@@ -66,7 +66,38 @@ try {
       firstFile: files[0]?.innerText, lastFile: files.at(-1)?.innerText,
       collection: region?.querySelector('p')?.innerText,
       scrollHeight: viewport?.scrollHeight, scrollTop: viewport?.scrollTop,
-      bodyTail: document.body.innerText.slice(-1000) };
+      renderedImages: document.images.length,
+      loadedImages: [...document.images].filter(image => image.complete && image.naturalWidth > 0).length };
   })()`);
-  console.log(JSON.stringify({ offline: args.includes('--offline'), heap, ui }, null, 2));
+  let security;
+  if (args.includes('--security')) {
+    security = await evaluate(`(async () => {
+      let dynamicCodeBlocked = false;
+      try { new Function('return 1')(); } catch (error) { dynamicCodeBlocked = error instanceof EvalError; }
+      const remoteScript = await new Promise(resolve => {
+        const url = 'https://example.com/revenant-acceptance-csp.js';
+        const script = document.createElement('script');
+        const timeout = setTimeout(() => finish(false), 3000);
+        function finish(blocked) {
+          clearTimeout(timeout); document.removeEventListener('securitypolicyviolation', violation);
+          script.remove(); resolve(blocked);
+        }
+        function violation(event) {
+          if (event.blockedURI === url && event.effectiveDirective.startsWith('script-src')) finish(true);
+        }
+        document.addEventListener('securitypolicyviolation', violation);
+        script.src = url; document.head.appendChild(script);
+      });
+      return { dynamicCodeBlocked, remoteScriptBlocked: remoteScript,
+        policy: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content ?? null };
+    })()`);
+    if (!security.dynamicCodeBlocked || !security.remoteScriptBlocked) {
+      throw new Error('Packaged CSP acceptance failed: ' + JSON.stringify(security));
+    }
+  }
+  console.log(JSON.stringify({ offline: args.includes('--offline'), heap, ui, security }, null, 2));
+  if (args.includes('--close')) {
+    // Destruction can tear down the debugger before its invoke promise replies.
+    await evaluate(`(() => { setTimeout(() => window.__TAURI__.core.invoke('plugin:window|destroy', { label: 'main' }), 0); return true; })()`);
+  }
 } finally { socket.close(); }

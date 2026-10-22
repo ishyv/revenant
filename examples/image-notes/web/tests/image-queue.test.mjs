@@ -3,6 +3,16 @@ import assert from "node:assert/strict";
 import { createImageRenderer, imageQueue } from "../src/lib/image-queue.ts";
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test("cache publication warnings reach visible feedback while the image remains usable", async () => {
+  const warnings = [];
+  const render = createImageRenderer(
+    async () => ({ dataUrl: "data:image/jpeg;base64,ok", width: 1, height: 1, cacheWarning: "Unmanaged files prevent caching" }),
+    (warning) => warnings.push(warning),
+  );
+  assert.equal(await render("image", false), "data:image/jpeg;base64,ok");
+  assert.deepEqual(warnings, ["Unmanaged files prevent caching"]);
+});
+
 test("image queue bounds admission, prioritizes previews and drops unmounted tiles", async () => {
   const started = [];
   const pending = new Map();
@@ -59,13 +69,13 @@ test("native rendering admits two calls and retains at most eighty cached URLs",
   const calls = [];
   const pending = new Map();
   let hold = true;
-  const render = createImageRenderer({
-    call(input) {
+  const render = createImageRenderer(
+    (input) => {
       calls.push(input);
       if (!hold) return Promise.resolve({ dataUrl: input.id });
       return new Promise((resolve) => pending.set(input.id, resolve));
     },
-  });
+  );
   const first = render("first", false);
   const second = render("second", true);
   const third = render("third", false);

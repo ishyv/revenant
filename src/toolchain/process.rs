@@ -78,6 +78,17 @@ pub struct LogLine {
 struct ProcessTree(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
+struct ProcessExitHandle(windows_sys::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+impl Drop for ProcessExitHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
 impl ProcessTree {
     fn attach(child: &Child) -> Result<Self> {
         use std::{
@@ -119,9 +130,83 @@ impl ProcessTree {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
         }
     }
-    fn wait_for_exit(&self) -> Result<()> {
+    fn exit_handles(&self) -> Result<Vec<ProcessExitHandle>> {
+        use windows_sys::Win32::{
+            Foundation::*,
+            System::{JobObjects::*, Threading::*},
+        };
+        // Job accounting can reach zero before the processes are signaled. Keep
+        // handles to the actual owned processes before requesting termination.
+        let header_words = 2 * std::mem::size_of::<u32>() / std::mem::size_of::<usize>();
+        let mut capacity = 64;
+        loop {
+            let mut storage = vec![0usize; header_words + capacity];
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicProcessIdList,
+                    storage.as_mut_ptr().cast(),
+                    std::mem::size_of_val(storage.as_slice()) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if queried == 0 {
+                let error = std::io::Error::last_os_error();
+                anyhow::ensure!(
+                    error.raw_os_error() == Some(ERROR_MORE_DATA as i32),
+                    "query owned process IDs: {error}"
+                );
+                anyhow::ensure!(
+                    capacity < 65_536,
+                    "owned process list exceeds cleanup bound"
+                );
+                capacity = (capacity * 2).min(65_536);
+                continue;
+            }
+            let count = unsafe {
+                (*(storage.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()))
+                    .NumberOfProcessIdsInList
+            } as usize;
+            anyhow::ensure!(count <= capacity, "invalid owned process list length");
+            let mut handles = Vec::with_capacity(count);
+            for &pid in &storage[header_words..header_words + count] {
+                let handle = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | 0x00100000,
+                        0,
+                        u32::try_from(pid)?,
+                    )
+                };
+                if handle.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                        continue;
+                    }
+                    return Err(error).context("open owned process exit handle");
+                }
+                let handle = ProcessExitHandle(handle);
+                let mut member = 0;
+                let queried = unsafe { IsProcessInJob(handle.0, self.0, &mut member) };
+                anyhow::ensure!(
+                    queried != 0,
+                    "check owned process identity: {}",
+                    std::io::Error::last_os_error()
+                );
+                // A PID that exited and was reused cannot authorize waiting on
+                // another application's process.
+                if member != 0 {
+                    handles.push(handle);
+                }
+            }
+            return Ok(handles);
+        }
+    }
+    fn wait_for_exit(
+        &self,
+        handles: &[ProcessExitHandle],
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         use windows_sys::Win32::System::JobObjects::*;
-        let deadline = std::time::Instant::now() + Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
         loop {
             let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
             let queried = unsafe {
@@ -139,7 +224,7 @@ impl ProcessTree {
                 std::io::Error::last_os_error()
             );
             if info.ActiveProcesses == 0 {
-                return Ok(());
+                break;
             }
             anyhow::ensure!(
                 std::time::Instant::now() < deadline,
@@ -147,6 +232,18 @@ impl ProcessTree {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        for handle in handles {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX - 1);
+            let status = unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(handle.0, millis)
+            };
+            anyhow::ensure!(
+                status == windows_sys::Win32::Foundation::WAIT_OBJECT_0,
+                "owned process did not signal termination within {SHUTDOWN_TIMEOUT_SECS} seconds (wait {status})"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -210,6 +307,7 @@ pub struct ManagedProcess {
     child: Child,
     threads: Vec<thread::JoinHandle<()>>,
     stopped: bool,
+    cleanup_error: Option<String>,
     #[cfg(windows)]
     tree: ProcessTree,
 }
@@ -289,6 +387,7 @@ impl ManagedProcess {
             child,
             threads,
             stopped: false,
+            cleanup_error: None,
             #[cfg(windows)]
             tree,
         })
@@ -298,11 +397,74 @@ impl ManagedProcess {
         self.child.try_wait().context("check child status")
     }
 
-    pub fn terminate_with_timeout(&mut self) {
-        if self.stopped {
-            return;
+    /// Observe exact Windows job membership without changing process ownership.
+    #[cfg(windows)]
+    pub fn owns_process(&self, process_id: u32) -> Result<bool> {
+        use windows_sys::Win32::{
+            Foundation::*,
+            System::{JobObjects::IsProcessInJob, Threading::*},
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+            if handle.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                    return Ok(false); // The observed process already exited.
+                }
+                return Err(error).context("open observed process for job membership");
+            }
+            let mut member = 0;
+            let queried = IsProcessInJob(handle, self.tree.0, &mut member);
+            let error = std::io::Error::last_os_error();
+            CloseHandle(handle);
+            anyhow::ensure!(
+                queried != 0,
+                "query observed process job membership: {error}"
+            );
+            Ok(member != 0)
         }
-        self.stopped = true;
+    }
+
+    pub fn terminate_with_timeout(&mut self) {
+        if let Err(error) = self.terminate_checked() {
+            eprintln!("Owned process-tree cleanup incomplete: {error:#}");
+        }
+    }
+
+    /// Await owned process termination; callers replacing a host must propagate failure.
+    pub fn terminate_checked(&mut self) -> Result<()> {
+        if let Some(error) = &self.cleanup_error {
+            anyhow::bail!("previous owned process-tree cleanup failed: {error}");
+        }
+        if self.stopped {
+            return Ok(());
+        }
+        let result = self.terminate_once();
+        match &result {
+            Ok(()) => self.stopped = true,
+            Err(error) => {
+                self.cleanup_error = Some(format!("{error:#}"));
+                // Reap pumps that have already finished without blocking a
+                // failed bounded cleanup on a still-open descendant pipe.
+                let mut pending = Vec::new();
+                for pump in self.threads.drain(..) {
+                    if pump.is_finished() {
+                        let _ = pump.join();
+                    } else {
+                        pending.push(pump);
+                    }
+                }
+                self.threads = pending;
+            }
+        }
+        result
+    }
+
+    fn terminate_once(&mut self) -> Result<()> {
+        #[cfg(windows)]
+        let deadline = std::time::Instant::now() + Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
+        #[cfg(windows)]
+        let handles = self.tree.exit_handles();
         #[cfg(windows)]
         self.tree.kill();
         #[cfg(unix)]
@@ -326,14 +488,11 @@ impl ManagedProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
         #[cfg(windows)]
-        if let Err(error) = self.tree.wait_for_exit() {
-            // Parent exit alone is insufficient: a descendant with redirected
-            // pipes can still hold a shadow executable mapped into memory.
-            eprintln!("Owned process-tree cleanup incomplete: {error:#}");
-        }
+        self.tree.wait_for_exit(&handles?, deadline)?;
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
+        Ok(())
     }
 }
 
@@ -360,17 +519,44 @@ pub fn run_capture_with_env(
     env: &[(&str, &str)],
     verbose: bool,
 ) -> Result<String> {
+    run_capture_with_logger(working_dir, program, args, env, verbose, true, console_log)
+}
+
+/// Capture machine stdout without echoing its payload, including verbose mode.
+/// Stderr diagnostics and process failure details remain visible.
+pub fn run_capture_data(
+    working_dir: &Path,
+    program: &str,
+    args: &[&str],
+    verbose: bool,
+) -> Result<String> {
+    run_capture_with_logger(working_dir, program, args, &[], verbose, false, console_log)
+}
+
+fn console_log(log: &LogLine) {
+    if log.is_stderr {
+        eprintln!("{}", log.line);
+    } else {
+        println!("{}", log.line);
+    }
+}
+
+fn run_capture_with_logger(
+    working_dir: &Path,
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    verbose: bool,
+    echo_stdout: bool,
+    mut logger: impl FnMut(&LogLine),
+) -> Result<String> {
     let (tx, rx) = mpsc::channel();
     let mut child = ManagedProcess::spawn_with_env(working_dir, program, args, env, program, tx)?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut collect = |log: LogLine| {
-        if verbose {
-            if log.is_stderr {
-                eprintln!("{}", log.line);
-            } else {
-                println!("{}", log.line);
-            }
+        if verbose && (log.is_stderr || echo_stdout) {
+            logger(&log);
         }
         let buffer = if log.is_stderr {
             &mut stderr
@@ -394,13 +580,109 @@ pub fn run_capture_with_env(
     while let Ok(log) = rx.try_recv() {
         collect(log);
     }
-    anyhow::ensure!(
-        status.success(),
-        "{program} exited with {status}:\n{stderr}{stdout}"
-    );
+    if !status.success() {
+        let preview = if echo_stdout {
+            stdout.clone()
+        } else {
+            let mut preview = stdout.chars().take(1024).collect::<String>();
+            if preview.len() < stdout.len() {
+                preview.push_str("\n[captured stdout truncated]");
+            }
+            preview
+        };
+        anyhow::bail!("{program} exited with {status}:\n{stderr}{preview}");
+    }
     Ok(stdout)
 }
 
 pub fn run_blocking(working_dir: &Path, program: &str, args: &[&str], verbose: bool) -> Result<()> {
     run_capture(working_dir, program, args, verbose).map(|_| ())
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    fn command() -> (&'static str, Vec<&'static str>) {
+        #[cfg(windows)]
+        {
+            (
+                "powershell.exe",
+                vec![
+                    "-NoProfile",
+                    "-Command",
+                    "Write-Output '{\"largeContract\":true}'; [Console]::Error.WriteLine('export diagnostic')",
+                ],
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            (
+                "sh",
+                vec![
+                    "-c",
+                    "printf '%s\\n' '{\"largeContract\":true}'; printf '%s\\n' 'export diagnostic' >&2",
+                ],
+            )
+        }
+    }
+
+    #[test]
+    fn data_capture_keeps_json_private_even_in_verbose_mode_and_shows_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        let (program, args) = command();
+        let mut logs = Vec::new();
+        let stdout =
+            run_capture_with_logger(directory.path(), program, &args, &[], true, false, |log| {
+                logs.push((log.is_stderr, log.line.clone()))
+            })
+            .unwrap();
+        assert!(stdout.contains("largeContract"));
+        assert_eq!(logs, vec![(true, "export diagnostic".into())]);
+    }
+
+    #[test]
+    fn ordinary_verbose_commands_keep_both_log_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let (program, args) = command();
+        let mut logs = Vec::new();
+        run_capture_with_logger(directory.path(), program, &args, &[], true, true, |log| {
+            logs.push(log.line.clone())
+        })
+        .unwrap();
+        assert!(logs.iter().any(|line| line.contains("largeContract")));
+        assert!(logs.iter().any(|line| line == "export diagnostic"));
+    }
+
+    #[test]
+    fn failed_data_capture_preserves_diagnostics_and_bounds_stdout_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let (program, args) = (
+            "powershell.exe",
+            vec![
+                "-NoProfile",
+                "-Command",
+                "Write-Output ('x' * 10000); [Console]::Error.WriteLine('export failed'); exit 7",
+            ],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "sh",
+            vec![
+                "-c",
+                "printf '%010000d\\n' 0; printf '%s\\n' 'export failed' >&2; exit 7",
+            ],
+        );
+        let error =
+            run_capture_with_logger(directory.path(), program, &args, &[], false, false, |_| {})
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("export failed"));
+        assert!(error.contains("[captured stdout truncated]"));
+        assert!(
+            error.len() < 1400,
+            "failed export dumped its machine payload"
+        );
+    }
 }

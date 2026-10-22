@@ -1,17 +1,23 @@
 [package]
 name = "revenant-desktop"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT"
 description = "Owned native capabilities and Tauri desktop lifecycle for Revenant"
 
 [features]
 default = ["tauri-host"]
 tauri-host = ["dep:tauri", "dep:tauri-plugin-dialog"]
+native-surfaces = ["tauri-host", "dep:revenant-graphics", "dep:raw-window-handle", "dep:pollster", "dep:windows-sys"]
 
 [dependencies]
-revenant-core = { version = "0.3.0", path = "../revenant-core" }
-revenant-sdk = { version = "0.3.0", path = "../revenant-sdk" }
+revenant-core = { version = "0.4.0", path = "../revenant-core" }
+revenant-sdk = { version = "0.4.0", path = "../revenant-sdk" }
+revenant-agent = { version = "0.4.0", path = "../revenant-agent" }
+revenant-graphics = { version = "0.4.0", path = "../revenant-graphics", optional = true, features = ["gpu"] }
+raw-window-handle = { version = "0.6", optional = true }
+pollster = { version = "0.4", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
@@ -22,3 +28,6 @@ mime_guess = "2"
 uuid = { version = "1", features = ["v4"] }
 tauri = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader"] }

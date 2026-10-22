@@ -1,6 +1,5 @@
 //! Desktop production pipeline: native compile, manifest export, SPA, packaging.
 use crate::{
-    compiled::BuildStage,
     config::{self, RevenantConfig},
     errors::RevenantError,
     toolchain::{desktop::DesktopBuild, process},
@@ -19,16 +18,36 @@ pub fn build_rust(
 ) -> Result<String> {
     let build = DesktopBuild::new(root, config, release)?;
     build.build(verbose)?;
-    BuildStage::new(root)?.publish(&build.executable, verbose)
+    build.publish(root, verbose)
 }
 
 /// Install the selected frontend manager's dependencies when not present.
 /// The scaffold declares Tauri CLI 2, so packaging does not require cargo install.
 pub fn ensure_frontend(root: &Path, config: &RevenantConfig, verbose: bool) -> Result<()> {
+    let project_lock = crate::inspection::acquire_project_lock(root)?;
+    ensure_frontend_with_project_lock(root, config, verbose, &project_lock)
+}
+
+pub(crate) fn ensure_frontend_with_project_lock(
+    root: &Path,
+    config: &RevenantConfig,
+    verbose: bool,
+    _project_lock: &std::fs::File,
+) -> Result<()> {
     crate::scaffold::prepare_host(root, config)?;
     let web = root.join("web");
     if !web.join("node_modules").is_dir() {
-        process::run_blocking(&web, &config.toolchain.pkg_manager, &["install"], verbose)
+        let arguments: &[&str] = match config.toolchain.pkg_manager.as_str() {
+            "npm"
+                if web.join("package-lock.json").is_file()
+                    || web.join("npm-shrinkwrap.json").is_file() =>
+            {
+                &["ci", "--install-links"]
+            }
+            "npm" => &["install", "--install-links"],
+            _ => &["install"],
+        };
+        process::run_blocking(&web, &config.toolchain.pkg_manager, arguments, verbose)
             .context("install frontend dependencies; the application scaffold is preserved")?;
     }
     anyhow::ensure!(
@@ -37,14 +56,7 @@ pub fn ensure_frontend(root: &Path, config: &RevenantConfig, verbose: bool) -> R
         "missing Tauri CLI 2; add @tauri-apps/cli = ^2 as a web devDependency and run {} install in web/",
         config.toolchain.pkg_manager
     );
-    let client = web.join("node_modules/@revenant/client/package.json");
-    let installed: serde_json::Value = serde_json::from_slice(&std::fs::read(&client).context(
-        "missing @revenant/client; run the frontend package manager's install in web/",
-    )?)?;
-    anyhow::ensure!(
-        installed["version"].as_str() == Some("0.3.0"),
-        "installed @revenant/client is not 0.3.0; preserve your SDK changes, update web/package.json to the 0.3 client snapshot, and reinstall frontend dependencies in web/. Existing contracts are preserved."
-    );
+    crate::scaffold::sdk::check_installed_client(root, true)?;
     Ok(())
 }
 
@@ -101,8 +113,8 @@ pub fn run(verbose: bool) -> Result<()> {
     // Tauri enables embedded assets and may compile again. Verify the final
     // executable before bundling so source edits during the frontend build
     // cannot produce an installer with an outdated generated contract.
-    let executable = DesktopBuild::new(&root, &config, true)?.executable;
-    let final_contract = process::run_capture(
+    let executable = DesktopBuild::executable_path(&root, &config, true);
+    let final_contract = process::run_capture_data(
         &root,
         &executable.to_string_lossy(),
         &["--revenant-contract"],

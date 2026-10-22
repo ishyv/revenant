@@ -1,0 +1,89 @@
+name: Non-Windows desktop smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Linux native prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: macOS native prerequisites
+        if: runner.os == 'macOS'
+        run: xcode-select -p
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Compile and check public contracts
+        env:
+          RUSTDOCFLAGS: '-D missing_docs -D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags'
+        run: |
+          cargo fmt --all -- --check
+          cargo check --workspace --all-features --locked
+          cargo check -p revenant-desktop --no-default-features --locked
+          cargo doc -p revenant-core -p revenant-sdk -p revenant-macros -p revenant-desktop -p revenant-agent -p revenant-graphics --all-features --no-deps --locked
+          npm ci --install-links --prefix packages/client
+          npm run check --prefix packages/client
+          npm run check:ui --prefix packages/client
+          node scripts/check-api-docs.mjs
+      - name: Native/client smoke and owned-process shutdown
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test -p revenant-sdk --release --test authoring_04 --test discovery_duplicates --locked
+          npm test --prefix packages/client
+          npm run test:ui --prefix packages/client
+          node --test scripts/inspection-semantic.test.mjs scripts/evaluate-agent-workflow.test.mjs
+          cargo build -p revenant --locked
+      - name: Package a fresh scaffold outside the checkout
+        run: |
+          cli="$GITHUB_WORKSPACE/target/debug/revenant"
+          outside="$RUNNER_TEMP/Revenant smoke café"
+          mkdir -p "$outside"
+          cd "$outside"
+          "$cli" new standalone-app
+          cd standalone-app
+          "$cli" build --verbose
+          npm run check --prefix web
+      - name: Verify bundles and provenance
+        run: |
+          bundle="$RUNNER_TEMP/Revenant smoke café/standalone-app/.revenant/target/release/bundle"
+          if [ "$RUNNER_OS" = Linux ]; then
+            test -n "$(find "$bundle" -type f -name '*.deb' -print -quit)"
+          else
+            test -n "$(find "$bundle" -type f -name '*.dmg' -print -quit)"
+            test -n "$(find "$bundle" -type d -name '*.app' -print -quit)"
+          fi
+          node scripts/write-build-evidence.mjs "$bundle"
+          node scripts/write-build-evidence.mjs --verify "$bundle"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-smoke-${{ runner.os }}
+          path: ${{ runner.temp }}/Revenant smoke café/standalone-app/.revenant/target/release/bundle
+          if-no-files-found: error

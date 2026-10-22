@@ -1,5 +1,5 @@
 /** Native provider inspection and transactional configuration. No JS execution providers. */
-import { assertJson } from "./contracts.js";
+import { cloneJson } from "./contracts.js";
 import type { Json, JsonSchema } from "./contracts.js";
 import { validator } from "./schema.js";
 import type { Scope } from "./scope.js";
@@ -63,12 +63,12 @@ export class Runtime implements Readable<readonly ProviderSnapshot[]> {
     config: C,
   ): Promise<void> {
     this.owner.assert();
-    assertJson(config);
-    validator(provider.configurationSchema)(config);
+    const value = cloneJson(config);
+    validator(provider.configurationSchema)(value);
     await this.owner.request({
       action: "runtime.configure",
       provider: provider.id,
-      config: structuredClone(config),
+      config: value,
     });
     await this.inspect();
   }

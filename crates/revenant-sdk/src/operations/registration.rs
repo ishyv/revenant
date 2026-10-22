@@ -1,5 +1,5 @@
 //! Typed executors deserialize before constructing a Send future. Every input handle is admitted through the task context before user work runs.
-use super::OperationDescriptor;
+use super::{OperationDescriptor, OperationEffect};
 use crate::{BoxFuture, Contract, Error, Handle, Result, TaskContext};
 use serde_json::Value;
 use std::{future::Future, sync::Arc};
@@ -52,7 +52,7 @@ where
 {
     fn validate_input(&self, input: &Value, context: &TaskContext) -> Result<()> {
         let input: I = serde_json::from_value(input.clone())?;
-        input.visit_handles(&mut |handle| context.lease(handle).map(|_| ()))
+        input.visit_handles(&mut |handle| context.admit_handle(handle))
     }
     fn input_handles(&self, input: &Value) -> Result<Vec<Handle>> {
         let input: I = serde_json::from_value(input.clone())?;
@@ -115,8 +115,14 @@ impl OperationRegistration {
             descriptor: OperationDescriptor {
                 id,
                 description: description.into(),
+                arguments: Vec::new(),
+                effect: OperationEffect::Unknown,
+                work_class: crate::WorkClass::Cpu,
+                independent: false,
+                agent: false,
                 input: I::definition()?,
                 output: O::definition()?,
+                updates: None,
                 source: None,
             },
             executor: Arc::new(TypedExecutor::<I, O, F> {
@@ -124,5 +130,12 @@ impl OperationRegistration {
                 marker: std::marker::PhantomData,
             }),
         })
+    }
+
+    /// Declares the compiled contract accepted by TaskContext::publish for this operation.
+    /// Generation includes its Rust DTOs; execution pins this schema to each task.
+    pub fn with_updates<U: Contract>(mut self) -> Result<Self> {
+        self.descriptor.updates = Some(U::definition()?);
+        Ok(self)
     }
 }

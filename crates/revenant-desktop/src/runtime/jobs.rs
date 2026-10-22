@@ -1,17 +1,20 @@
 //! Bounded native admission, captured inputs, and disk-backed batch outcomes.
 //!
 //! Queued jobs pin provider generations and inputs before returning to Svelte.
-//! A batch pins one native selector, then owns one item's file at a time. Completed
+//! A batch pins one native selector, then owns a bounded set of in-flight files. Completed
 //! outcomes are committed in chunks; task snapshots retain counters, not inventory.
 
-use super::views::ViewRecord;
+use super::inspect::TraceContext;
+use super::views::{IndexLease, ViewRecord};
 use super::{DesktopRuntime, Error, Result, UpdateSink, id, lock};
 use crate::{
     file_port::FilePort,
     files::IndexState,
     results::{BatchOutcome, ResultStore},
 };
-use revenant_core::{Handle, Progress, ResourceLease, Subscription, TaskContext, TaskSnapshot};
+use revenant_core::{
+    Handle, NativeResourceLease, Progress, ResourceLease, Subscription, TaskContext, TaskSnapshot,
+};
 use revenant_sdk::PreparedOperation;
 use serde_json::{Value, json};
 use std::{
@@ -29,10 +32,44 @@ pub(crate) struct JobRecord {
     admitted: Arc<AtomicBool>,
     pub _subscription: Subscription,
     pub resources: Arc<ResultResources>,
+    pub finished: AtomicBool,
+    pub operation: String,
+    pub trace: TraceContext,
+}
+/// Each scheduled native reader holds a clone. The last exit settles history,
+/// even if its async supervisor or independent-batch coordinator unwound.
+#[derive(Clone)]
+struct ExecutionCompletion {
+    _state: Arc<ExecutionCompletionState>,
+}
+struct ExecutionCompletionState {
+    runtime: DesktopRuntime,
+    job: Arc<JobRecord>,
+}
+impl ExecutionCompletion {
+    fn new(runtime: DesktopRuntime, job: Arc<JobRecord>) -> Self {
+        Self {
+            _state: Arc::new(ExecutionCompletionState { runtime, job }),
+        }
+    }
+}
+impl Drop for ExecutionCompletionState {
+    fn drop(&mut self) {
+        // Normal executors already finalized through their core guard. Queue or
+        // supervisor failure can happen before begin; cleanup must still settle
+        // that logical task without a second observer unwind escaping this Drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !self.job.context.snapshot().state.is_terminal() {
+                let _ = self.job.context.interrupt();
+            }
+        }));
+        self.runtime.finish_execution(&self.job);
+    }
 }
 /// Result leases are independent of executor caches and live with native history.
 pub(crate) struct ResultResources {
     pub leases: Mutex<std::collections::HashMap<Handle, ResourceLease>>,
+    pub native_leases: Mutex<std::collections::HashMap<Handle, NativeResourceLease>>,
 }
 impl ResultResources {
     fn retain(
@@ -42,22 +79,59 @@ impl ResultResources {
         context: &TaskContext,
     ) -> Result<()> {
         let handles = prepared.output_handles(output)?;
-        let mut retained = lock(&self.leases);
+        let missing = {
+            let retained = lock(&self.leases);
+            let native_retained = lock(&self.native_leases);
+            handles
+                .into_iter()
+                .filter(|handle| {
+                    if handle.kind == "file" {
+                        !retained.contains_key(handle)
+                    } else {
+                        !native_retained.contains_key(handle)
+                    }
+                })
+                .collect::<std::collections::HashSet<_>>()
+        };
+        // Lease acquisition checkpoints invoke application callbacks. In particular,
+        // reentrant task admission may consult these same history maps.
         let mut additions = Vec::new();
-        for handle in handles {
-            if !retained.contains_key(&handle)
-                && !additions.iter().any(|(known, _)| known == &handle)
-            {
+        let mut native_additions = Vec::new();
+        for handle in missing {
+            if handle.kind == "file" {
                 additions.push((handle.clone(), context.lease(&handle)?));
+            } else {
+                native_additions.push((handle.clone(), context.native_lease(&handle)?));
             }
         }
-        if retained.len() + additions.len() > 512 {
+        // Batch items can publish concurrently. Recheck absence and combined
+        // capacity atomically, and drop all candidate leases after unlocking.
+        let mut retained = lock(&self.leases);
+        let mut native_retained = lock(&self.native_leases);
+        let extra = additions
+            .iter()
+            .filter(|(handle, _)| !retained.contains_key(handle))
+            .count()
+            + native_additions
+                .iter()
+                .filter(|(handle, _)| !native_retained.contains_key(handle))
+                .count();
+        if retained.len() + native_retained.len() + extra > 512 {
             return Err(Error::new(
                 "result_resource_limit",
                 "A result may retain at most 512 distinct resources; return metadata or dispose earlier results",
             ));
         }
-        retained.extend(additions);
+        for (handle, lease) in &additions {
+            retained
+                .entry(handle.clone())
+                .or_insert_with(|| lease.clone());
+        }
+        for (handle, lease) in &native_additions {
+            native_retained
+                .entry(handle.clone())
+                .or_insert_with(|| lease.clone());
+        }
         Ok(())
     }
 }
@@ -80,15 +154,40 @@ enum BatchSource {
     Matching {
         view: Arc<ViewRecord>,
         query: crate::files::FileQuery,
+        _inventory: IndexLease,
     },
     Captured(Arc<SelectionRecord>),
     Inputs(Vec<(Value, TaskContext)>),
 }
 
+enum BatchIterator {
+    Matching(crate::files::FileSelection),
+    Captured(std::vec::IntoIter<ResourceLease>),
+    Inputs(std::vec::IntoIter<(Value, TaskContext)>),
+}
+struct BatchItems {
+    iterator: BatchIterator,
+    total: u64,
+    _inventory: Option<IndexLease>,
+    _selection: Option<Arc<SelectionRecord>>,
+}
+struct BatchItem {
+    ordinal: u64,
+    input: Value,
+    child: TaskContext,
+    _owner: Option<FileOwner>,
+}
+
 impl DesktopRuntime {
-    fn make_job(&self, scope: &str, sink: Option<UpdateSink>) -> Result<Arc<JobRecord>> {
+    fn make_job(
+        &self,
+        scope: &str,
+        operation: &str,
+        trace: TraceContext,
+        sink: Option<UpdateSink>,
+    ) -> Result<Arc<JobRecord>> {
         self.accepting()?;
-        self.scope_window(scope)?;
+        self.scope_owner(scope)?;
         let mut jobs = lock(&self.inner.jobs);
         if jobs.len() >= self.inner.options.max_tasks {
             return Err(Error::new(
@@ -100,16 +199,43 @@ impl DesktopRuntime {
         let admitted = Arc::new(AtomicBool::new(false));
         let publish_admitted = admitted.clone();
         let last = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
+        let trace_runtime = Arc::downgrade(&self.inner);
+        let trace_context = trace.clone();
+        let trace_operation = operation.to_owned();
+        let last_state = Mutex::new(None);
         let subscription = context.subscribe(Arc::new(move |snapshot: TaskSnapshot| {
             // Failed admission reports the invoke error, never a misleading
             // cancellation snapshot from its private cleanup task.
             if !publish_admitted.load(Ordering::Acquire) {
                 return;
             }
+            let mut previous = lock(&last_state);
+            if previous.as_ref() != Some(&snapshot.state) {
+                *previous = Some(snapshot.state);
+                if let Some(inner) = trace_runtime.upgrade() {
+                    lock(&inner.trace).push(
+                        &trace_context,
+                        "task.state",
+                        Some(&trace_operation),
+                        Some(&snapshot.id),
+                        Some(snapshot.state),
+                        snapshot.error.as_ref().map(|error| error.code.as_str()),
+                    );
+                }
+            }
+            drop(previous);
             if let Some(sink) = &sink {
-                let mut last = lock(&last);
-                if snapshot.state.is_terminal() || last.elapsed() >= Duration::from_millis(50) {
-                    *last = Instant::now();
+                let publish = {
+                    let mut last = lock(&last);
+                    let publish =
+                        snapshot.state.is_terminal() || last.elapsed() >= Duration::from_millis(50);
+                    if publish {
+                        *last = Instant::now();
+                    }
+                    publish
+                };
+                // A sink may cancel or dispose this task synchronously.
+                if publish {
                     if let Ok(value) = serde_json::to_value(snapshot) {
                         sink(value);
                     }
@@ -124,7 +250,11 @@ impl DesktopRuntime {
             _subscription: subscription,
             resources: Arc::new(ResultResources {
                 leases: Mutex::new(std::collections::HashMap::new()),
+                native_leases: Mutex::new(std::collections::HashMap::new()),
             }),
+            finished: AtomicBool::new(false),
+            operation: operation.into(),
+            trace,
         });
         jobs.insert(job.context.id().into(), job.clone());
         Ok(job)
@@ -137,6 +267,17 @@ impl DesktopRuntime {
         operation: &str,
         input: Value,
         sink: Option<UpdateSink>,
+    ) -> Result<TaskSnapshot> {
+        self.run_task_traced(scope, operation, input, sink, TraceContext::native())
+    }
+
+    pub(crate) fn run_task_traced(
+        &self,
+        scope: &str,
+        operation: &str,
+        input: Value,
+        sink: Option<UpdateSink>,
+        trace: TraceContext,
     ) -> Result<TaskSnapshot> {
         if serde_json::to_vec(&input)?.len() > self.inner.options.max_contract_bytes {
             return Err(Error::new(
@@ -151,7 +292,7 @@ impl DesktopRuntime {
             .try_acquire_owned()
             .map_err(|_| Error::new("queue_full", "Native work queue is full").retryable(true))?;
         let prepared = self.inner.registry.prepare_operation(operation)?;
-        let job = self.make_job(scope, sink)?;
+        let job = self.make_job(scope, operation, trace, sink)?;
         if let Err(error) = self.admit_input(&prepared, &input, &job.context) {
             let _ = job.context.request_cancel();
             lock(&self.inner.jobs).remove(job.context.id());
@@ -160,15 +301,16 @@ impl DesktopRuntime {
         }
         job.admitted.store(true, Ordering::Release);
         let initial = job.context.snapshot();
+        self.trace_task_admission(&job);
         let runtime = self.clone();
+        let completion = ExecutionCompletion::new(runtime.clone(), job.clone());
         tokio::spawn(async move {
             let worker = loop {
                 if job.context.snapshot().state.is_terminal() {
-                    runtime.finish_disposed_job(&job);
                     return;
                 }
                 tokio::select! {
-                    permit = runtime.inner.workers.clone().acquire_owned() => { let Ok(permit) = permit else { return }; break permit; }
+                    permit = runtime.inner.work.acquire(prepared.descriptor().work_class) => { let Ok(permit) = permit else { return }; break permit; }
                     _ = tokio::time::sleep(Duration::from_millis(20)) => {}
                 }
             };
@@ -176,8 +318,9 @@ impl DesktopRuntime {
             let native = job.clone();
             let executor = tokio::runtime::Handle::current();
             let result = tokio::task::spawn_blocking(move || {
+                let _completion = completion;
                 let _admission = admission;
-                let _worker = worker;
+                let _worker = rt.inner.work.enter(worker);
                 let execution = native.context.begin()?;
                 let mut result = executor.block_on(prepared.execute(input, native.context.clone()));
                 if result.as_ref().is_ok_and(|value| {
@@ -189,11 +332,10 @@ impl DesktopRuntime {
                         "Return a native resource or paged result for large output",
                     ));
                 }
-                if let Ok(output) = &result {
-                    if let Err(error) = native.resources.retain(&prepared, output, &native.context)
-                    {
-                        result = Err(error);
-                    }
+                if let Ok(output) = &result
+                    && let Err(error) = native.resources.retain(&prepared, output, &native.context)
+                {
+                    result = Err(error);
                 }
                 execution.finish(result)?;
                 Ok::<(), Error>(())
@@ -203,7 +345,6 @@ impl DesktopRuntime {
                 let _ = job.context.request_cancel();
                 let _ = error;
             }
-            runtime.finish_disposed_job(&job);
         });
         Ok(initial)
     }
@@ -216,7 +357,7 @@ impl DesktopRuntime {
         selection_id: Option<&str>,
         handles: Vec<Handle>,
     ) -> Result<Value> {
-        self.scope_window(scope)?;
+        self.scope_owner(scope)?;
         if handles.len() > 512 {
             return Err(Error::new(
                 "selection_limit",
@@ -265,13 +406,13 @@ impl DesktopRuntime {
             .map(str::to_owned)
             .unwrap_or_else(|| id("selection"));
         let mut selections = lock(&self.inner.selections);
-        if let Some(old) = selections.get(&selection) {
-            if old.scope != scope {
-                return Err(Error::new(
-                    "scope_mismatch",
-                    "Selection belongs to another scope",
-                ));
-            }
+        if let Some(old) = selections.get(&selection)
+            && old.scope != scope
+        {
+            return Err(Error::new(
+                "scope_mismatch",
+                "Selection belongs to another scope",
+            ));
         }
         let count = leases.len();
         selections.insert(
@@ -306,6 +447,17 @@ impl DesktopRuntime {
         selection: Value,
         sink: Option<UpdateSink>,
     ) -> Result<TaskSnapshot> {
+        self.run_batch_traced(scope, operation, selection, sink, TraceContext::native())
+    }
+
+    pub(crate) fn run_batch_traced(
+        &self,
+        scope: &str,
+        operation: &str,
+        selection: Value,
+        sink: Option<UpdateSink>,
+        trace: TraceContext,
+    ) -> Result<TaskSnapshot> {
         let admission = self
             .inner
             .admission
@@ -313,7 +465,7 @@ impl DesktopRuntime {
             .try_acquire_owned()
             .map_err(|_| Error::new("queue_full", "Native work queue is full").retryable(true))?;
         let prepared = self.inner.registry.prepare_operation(operation)?;
-        let job = self.make_job(scope, sink)?;
+        let job = self.make_job(scope, operation, trace, sink)?;
         let source_result = (|| {
             Ok(if let Some(inputs) = selection.get("inputs") {
                 let inputs: Vec<Value> = serde_json::from_value(inputs.clone())?;
@@ -328,7 +480,11 @@ impl DesktopRuntime {
                 let total = inputs.len() as u32;
                 let mut children = Vec::with_capacity(inputs.len());
                 for (index, input) in inputs.into_iter().enumerate() {
-                    let child = job.context.batch_child(index as u32, total)?;
+                    let child = if prepared.descriptor().independent {
+                        job.context.independent_batch_child(index as u32, total)?
+                    } else {
+                        job.context.batch_child(index as u32, total)?
+                    };
                     self.admit_input(&prepared, &input, &child)?;
                     children.push((input, child));
                 }
@@ -375,7 +531,12 @@ impl DesktopRuntime {
                 {
                     let query = lock(&view.query).clone();
                     drop(publishing);
-                    BatchSource::Matching { view, query }
+                    let inventory = view.index.retain()?;
+                    BatchSource::Matching {
+                        view,
+                        query,
+                        _inventory: inventory,
+                    }
                 } else {
                     drop(publishing);
                     let handles: Vec<Handle> = serde_json::from_value(
@@ -409,14 +570,14 @@ impl DesktopRuntime {
         *lock(&job.results) = Some(store.clone());
         job.admitted.store(true, Ordering::Release);
         let initial = job.context.snapshot();
+        self.trace_task_admission(&job);
         let runtime = self.clone();
+        let completion = ExecutionCompletion::new(runtime.clone(), job.clone());
         tokio::spawn(async move {
             if job.context.snapshot().state.is_terminal() {
-                runtime.finish_disposed_job(&job);
                 return;
             }
             let Ok(execution) = job.context.begin() else {
-                runtime.finish_disposed_job(&job);
                 return;
             };
             let reference = json!({"task":job.context.id(),"paged":true});
@@ -429,7 +590,6 @@ impl DesktopRuntime {
                 loop {
                     if let Err(error) = job.context.checkpoint() {
                         let _ = execution.finish_batch(reference, error.is_cancelled());
-                        runtime.finish_disposed_job(&job);
                         return;
                     }
                     match view.index.index.status() {
@@ -444,36 +604,53 @@ impl DesktopRuntime {
                                 "index_incomplete",
                                 "Folder discovery did not complete",
                             )));
-                            runtime.finish_disposed_job(&job);
                             return;
                         }
                         Err(error) => {
                             let _ = execution.finish(Err(error));
-                            runtime.finish_disposed_job(&job);
                             return;
                         }
                         _ => tokio::time::sleep(Duration::from_millis(20)).await,
                     }
                 }
             }
-            let worker = loop {
-                if job.context.checkpoint().is_err() {
-                    let _ = execution.finish_batch(reference, true);
-                    runtime.finish_disposed_job(&job);
-                    return;
-                }
-                tokio::select! {
-                    permit = runtime.inner.workers.clone().acquire_owned() => { let Ok(permit) = permit else { return }; break permit; }
-                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-                }
+            let independent = prepared.descriptor().independent;
+            let worker = if independent {
+                None
+            } else {
+                Some(loop {
+                    if job.context.checkpoint().is_err() {
+                        let _ = execution.finish_batch(reference, true);
+                        return;
+                    }
+                    tokio::select! {
+                        permit = runtime.inner.work.acquire(prepared.descriptor().work_class) => { let Ok(permit) = permit else { return }; break permit; }
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
+                })
             };
             let native = job.clone();
             let rt = runtime.clone();
             let executor = tokio::runtime::Handle::current();
             let _ = tokio::task::spawn_blocking(move || {
-                let _worker = worker;
+                let _completion = completion;
+                // Move the captured core guard into a local so it is destroyed
+                // before completion bookkeeping when this worker unwinds.
+                let execution = execution;
+                let _worker = worker.map(|permit| rt.inner.work.enter(permit));
                 let _admission = admission;
-                let result = rt.execute_batch(&native, &prepared, source, &store, &executor);
+                let result = if independent {
+                    executor.block_on(rt.execute_independent_batch(
+                        native.clone(),
+                        Arc::new(prepared),
+                        source,
+                        store,
+                        executor.clone(),
+                        &_completion,
+                    ))
+                } else {
+                    rt.execute_batch(&native, &prepared, source, &store, &executor)
+                };
                 match result {
                     Ok(()) => {
                         let _ = execution.finish_batch(reference, false);
@@ -487,7 +664,6 @@ impl DesktopRuntime {
                 }
             })
             .await;
-            runtime.finish_disposed_job(&job);
         });
         Ok(initial)
     }
@@ -501,32 +677,8 @@ impl DesktopRuntime {
         executor: &tokio::runtime::Handle,
     ) -> Result<()> {
         let context = &job.context;
-        enum Items {
-            Matching(crate::files::FileSelection),
-            Captured(std::vec::IntoIter<ResourceLease>),
-            Inputs(std::vec::IntoIter<(Value, TaskContext)>),
-        }
-        let (mut items, total) = match source {
-            BatchSource::Matching { view, query } => {
-                let selection = view.index.index.selection(&query)?;
-                let total = selection.total();
-                (Items::Matching(selection), total)
-            }
-            BatchSource::Captured(selection) => (
-                Items::Captured(selection.leases.clone().into_iter()),
-                selection.leases.len() as u64,
-            ),
-            BatchSource::Inputs(inputs) => {
-                let total = inputs.len() as u64;
-                (Items::Inputs(inputs.into_iter()), total)
-            }
-        };
-        let total32 = u32::try_from(total).map_err(|_| {
-            Error::new(
-                "batch_too_large",
-                "Batch exceeds supported item-index space",
-            )
-        })?;
+        let mut items = self.batch_items(source)?;
+        let total = items.total;
         context.progress(Progress {
             completed: 0.into(),
             total: Some(total.into()),
@@ -537,98 +689,10 @@ impl DesktopRuntime {
         let result = (|| {
             loop {
                 context.checkpoint()?;
-                let (input, retained, _owner, admitted_child) = match &mut items {
-                    Items::Matching(selection) => {
-                        let Some(item) = selection.next() else { break };
-                        let item = item?;
-                        let port = FilePort::new(item.path, item.metadata.clone());
-                        let entry = self.inner.resources.register_file_owned(
-                            context.scope(),
-                            item.metadata,
-                            port,
-                            Some("files"),
-                            None,
-                        )?;
-                        (
-                            serde_json::to_value(&entry)?,
-                            None,
-                            Some(FileOwner {
-                                resources: self.inner.resources.clone(),
-                                scope: context.scope().into(),
-                                handle: entry.handle,
-                            }),
-                            None,
-                        )
-                    }
-                    Items::Captured(leases) => {
-                        let Some(lease) = leases.next() else { break };
-                        (
-                            serde_json::to_value(
-                                lease.metadata().clone().entry(lease.handle().clone())?,
-                            )?,
-                            Some(lease),
-                            None,
-                            None,
-                        )
-                    }
-                    Items::Inputs(inputs) => {
-                        let Some((input, child)) = inputs.next() else {
-                            break;
-                        };
-                        (input, None, None, Some(child))
-                    }
+                let Some(item) = self.next_batch_item(context, &mut items, ordinal, false)? else {
+                    break;
                 };
-                let child = match admitted_child {
-                    Some(child) => child,
-                    None => context.batch_child(ordinal as u32, total32)?,
-                };
-                if let Some(lease) = retained {
-                    child.capture(lease)?;
-                }
-                let child_execution = child.begin()?;
-                let mut output = executor.block_on(prepared.execute(input.clone(), child.clone()));
-                if let Ok(value) = &output {
-                    if serde_json::to_vec(value)?.len() > self.inner.options.max_contract_bytes {
-                        output = Err(Error::new(
-                            "output_too_large",
-                            "Return a native resource for large results",
-                        ));
-                    } else if let Err(error) = job.resources.retain(prepared, value, &child) {
-                        output = Err(error);
-                    }
-                }
-                child_execution.finish(output.clone())?;
-                let outcome = match output {
-                    Ok(output) => {
-                        if serde_json::to_vec(&output)?.len()
-                            > self.inner.options.max_contract_bytes
-                        {
-                            BatchOutcome {
-                                ordinal,
-                                input,
-                                output: None,
-                                error: Some(serde_json::to_value(Error::new(
-                                    "output_too_large",
-                                    "Return a native resource for large results",
-                                ))?),
-                            }
-                        } else {
-                            BatchOutcome {
-                                ordinal,
-                                input,
-                                output: Some(output),
-                                error: None,
-                            }
-                        }
-                    }
-                    Err(error) if error.is_cancelled() => return Err(error),
-                    Err(error) => BatchOutcome {
-                        ordinal,
-                        input,
-                        output: None,
-                        error: Some(serde_json::to_value(error)?),
-                    },
-                };
+                let outcome = self.execute_batch_item(job, prepared, item, executor)?;
                 pending.push(outcome);
                 ordinal += 1;
                 context.progress(Progress {
@@ -647,6 +711,241 @@ impl DesktopRuntime {
         result
     }
 
+    fn batch_items(&self, source: BatchSource) -> Result<BatchItems> {
+        let items = match source {
+            BatchSource::Matching {
+                view,
+                query,
+                _inventory,
+            } => {
+                let selection = view.index.index.selection(&query)?;
+                BatchItems {
+                    total: selection.total(),
+                    iterator: BatchIterator::Matching(selection),
+                    _inventory: Some(_inventory),
+                    _selection: None,
+                }
+            }
+            BatchSource::Captured(selection) => BatchItems {
+                total: selection.leases.len() as u64,
+                iterator: BatchIterator::Captured(selection.leases.clone().into_iter()),
+                _inventory: None,
+                _selection: Some(selection),
+            },
+            BatchSource::Inputs(inputs) => BatchItems {
+                total: inputs.len() as u64,
+                iterator: BatchIterator::Inputs(inputs.into_iter()),
+                _inventory: None,
+                _selection: None,
+            },
+        };
+        u32::try_from(items.total).map_err(|_| {
+            Error::new(
+                "batch_too_large",
+                "Batch exceeds supported item-index space",
+            )
+        })?;
+        Ok(items)
+    }
+
+    fn next_batch_item(
+        &self,
+        context: &TaskContext,
+        items: &mut BatchItems,
+        ordinal: u64,
+        independent: bool,
+    ) -> Result<Option<BatchItem>> {
+        let (input, retained, owner, admitted_child) = match &mut items.iterator {
+            BatchIterator::Matching(selection) => {
+                let Some(item) = selection.next() else {
+                    return Ok(None);
+                };
+                let item = item?;
+                let entry = self.inner.resources.register_file_owned(
+                    context.scope(),
+                    item.metadata.clone(),
+                    FilePort::new(item.path, item.metadata),
+                    Some("files"),
+                    None,
+                )?;
+                (
+                    serde_json::to_value(&entry)?,
+                    None,
+                    Some(FileOwner {
+                        resources: self.inner.resources.clone(),
+                        scope: context.scope().into(),
+                        handle: entry.handle,
+                    }),
+                    None,
+                )
+            }
+            BatchIterator::Captured(leases) => {
+                let Some(lease) = leases.next() else {
+                    return Ok(None);
+                };
+                (
+                    serde_json::to_value(lease.metadata().clone().entry(lease.handle().clone())?)?,
+                    Some(lease),
+                    None,
+                    None,
+                )
+            }
+            BatchIterator::Inputs(inputs) => {
+                let Some((input, child)) = inputs.next() else {
+                    return Ok(None);
+                };
+                (input, None, None, Some(child))
+            }
+        };
+        let child = match admitted_child {
+            Some(child) => child,
+            None if independent => {
+                context.independent_batch_child(ordinal as u32, items.total as u32)?
+            }
+            None => context.batch_child(ordinal as u32, items.total as u32)?,
+        };
+        if let Some(lease) = retained {
+            child.capture(lease)?;
+        }
+        Ok(Some(BatchItem {
+            ordinal,
+            input,
+            child,
+            _owner: owner,
+        }))
+    }
+
+    fn execute_batch_item(
+        &self,
+        job: &JobRecord,
+        prepared: &PreparedOperation,
+        item: BatchItem,
+        executor: &tokio::runtime::Handle,
+    ) -> Result<BatchOutcome> {
+        let BatchItem {
+            ordinal,
+            input,
+            child,
+            _owner,
+        } = item;
+        child.checkpoint()?;
+        let execution = child.begin()?;
+        let mut output = executor.block_on(prepared.execute(input.clone(), child.clone()));
+        if let Ok(value) = &output {
+            if serde_json::to_vec(value)?.len() > self.inner.options.max_contract_bytes {
+                output = Err(Error::new(
+                    "output_too_large",
+                    "Return a native resource for large results",
+                ));
+            } else if let Err(error) = job.resources.retain(prepared, value, &child) {
+                output = Err(error);
+            }
+        }
+        execution.finish(output.clone())?;
+        match output {
+            Ok(output) => Ok(BatchOutcome {
+                ordinal,
+                input,
+                output: Some(output),
+                error: None,
+            }),
+            Err(error) if error.is_cancelled() => Err(error),
+            Err(error) => {
+                lock(&self.inner.trace).batch_item_failed(
+                    &job.trace,
+                    &job.operation,
+                    job.context.id(),
+                    ordinal,
+                    &error.code,
+                );
+                Ok(BatchOutcome {
+                    ordinal,
+                    input,
+                    output: None,
+                    error: Some(serde_json::to_value(error)?),
+                })
+            }
+        }
+    }
+
+    async fn execute_independent_batch(
+        &self,
+        job: Arc<JobRecord>,
+        prepared: Arc<PreparedOperation>,
+        source: BatchSource,
+        store: Arc<ResultStore>,
+        executor: tokio::runtime::Handle,
+        completion: &ExecutionCompletion,
+    ) -> Result<()> {
+        let mut items = self.batch_items(source)?;
+        let context = &job.context;
+        context.progress(Progress {
+            completed: 0.into(),
+            total: Some(items.total.into()),
+            message: Some("Processing selected items".into()),
+        })?;
+        let mut running = tokio::task::JoinSet::new();
+        let mut ordinal = 0;
+        let mut completed = 0;
+        let mut pending = Vec::with_capacity(128);
+        let mut failure = None;
+        let maximum_in_flight = self.inner.options.concurrency.min(128);
+        while ordinal < items.total || !running.is_empty() {
+            if failure.is_none() {
+                failure = context.checkpoint().err();
+            }
+            if failure.is_some() && running.is_empty() {
+                break;
+            }
+            let can_schedule =
+                failure.is_none() && ordinal < items.total && running.len() < maximum_in_flight;
+            tokio::select! {
+                permit = self.inner.work.acquire(prepared.descriptor().work_class), if can_schedule => {
+                    let permit = match permit { Ok(permit) => permit, Err(_) => { failure = Some(Error::new("app_closing", "Native executor is closed")); continue; } };
+                    if let Err(error) = context.checkpoint() { failure = Some(error); continue; }
+                    let item = match self.next_batch_item(context, &mut items, ordinal, true) {
+                        Ok(Some(item)) => item,
+                        Ok(None) => { ordinal = items.total; continue; }
+                        Err(error) => { failure = Some(error); let _ = context.request_cancel(); continue; }
+                    };
+                    ordinal += 1;
+                    let runtime = self.clone();
+                    let native = job.clone();
+                    let prepared = prepared.clone();
+                    let executor = executor.clone();
+                    let completion = completion.clone();
+                    running.spawn_blocking(move || {
+                        let _completion = completion;
+                        let _permit = runtime.inner.work.enter(permit);
+                        runtime.execute_batch_item(&native, &prepared, item, &executor)
+                    });
+                }
+                result = running.join_next(), if !running.is_empty() => {
+                    match result {
+                        Some(Ok(Ok(outcome))) => {
+                            pending.push(outcome);
+                            completed += 1;
+                            let _ = context.progress(Progress { completed: completed.into(), total: Some(items.total.into()), message: Some("Processing selected items".into()) });
+                            if pending.len() == 128
+                                && let Err(error) = self.commit_outcomes(context, &store, &mut pending) { failure = Some(error); let _ = context.request_cancel(); }
+                        }
+                        Some(Ok(Err(error))) => { if failure.is_none() { failure = Some(error); } let _ = context.request_cancel(); }
+                        Some(Err(error)) => { failure = Some(Error::new("native_executor", error.to_string())); let _ = context.request_cancel(); }
+                        None => {}
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        // Never abandon a native reader on cancellation: all child threads have
+        // exited before these source/provider guards and admission are released.
+        self.commit_outcomes(context, &store, &mut pending)?;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn remove_unadmitted(&self, job: &Arc<JobRecord>) {
         let _ = job.context.request_cancel();
         lock(&self.inner.jobs).remove(job.context.id());
@@ -662,12 +961,16 @@ impl DesktopRuntime {
         context: &TaskContext,
     ) -> Result<()> {
         for handle in prepared.input_handles(input)? {
-            context.capture(self.lease_resource(context.scope(), &handle)?)?;
+            if handle.kind == "file" {
+                context.capture(self.lease_resource(context.scope(), &handle)?)?;
+            } else {
+                context.capture_native(self.lease_native_resource(context.scope(), &handle)?)?;
+            }
         }
         prepared.prepare_input(input, context)
     }
     pub(crate) fn lease_resource(&self, scope: &str, handle: &Handle) -> Result<ResourceLease> {
-        self.scope_window(scope)?;
+        self.scope_owner(scope)?;
         if handle.scope != scope {
             return Err(Error::new(
                 "scope_mismatch",
@@ -693,6 +996,36 @@ impl DesktopRuntime {
                         .leases
                         .iter()
                         .find(|lease| lease.handle() == handle)
+                    {
+                        return Ok(lease.clone());
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn lease_native_resource(
+        &self,
+        scope: &str,
+        handle: &Handle,
+    ) -> Result<NativeResourceLease> {
+        self.scope_owner(scope)?;
+        if handle.scope != scope {
+            return Err(Error::new(
+                "scope_mismatch",
+                "Resource belongs to another scope",
+            ));
+        }
+        match self.inner.resources.lease_native_handle(scope, handle) {
+            Ok(lease) => Ok(lease),
+            Err(error) => {
+                for job in lock(&self.inner.jobs)
+                    .values()
+                    .filter(|job| job.context.scope() == scope)
+                {
+                    if let Some(lease) = lock(&job.resources.native_leases).get(handle)
+                        && !lease.is_revoked()
                     {
                         return Ok(lease.clone());
                     }
@@ -738,20 +1071,38 @@ impl DesktopRuntime {
             .filter(|job| job.context.scope() == scope)
             .cloned()
             .collect();
+        let mut panic = None;
         for job in jobs {
             job.disposed.store(true, Ordering::Release);
-            let _ = job.context.request_cancel();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = job.context.request_cancel();
+            }));
             self.finish_disposed_job(&job);
+            if let Err(payload) = outcome {
+                if panic.is_none() {
+                    panic = Some(payload);
+                }
+            }
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
     }
     fn finish_disposed_job(&self, job: &Arc<JobRecord>) {
-        if job.disposed.load(Ordering::Acquire) && job.context.snapshot().state.is_terminal() {
+        if job.disposed.load(Ordering::Acquire)
+            && job.finished.load(Ordering::Acquire)
+            && job.context.snapshot().state.is_terminal()
+        {
             lock(&self.inner.jobs).remove(job.context.id());
             let _ = self
                 .inner
                 .tasks
                 .remove(job.context.scope(), job.context.id());
         }
+    }
+    fn finish_execution(&self, job: &Arc<JobRecord>) {
+        job.finished.store(true, Ordering::Release);
+        self.finish_disposed_job(job);
     }
     /// Requests cancellation; terminal task history remains available until disposal.
     pub fn cancel_task(&self, scope: &str, task: &str) -> Result<TaskSnapshot> {
@@ -761,7 +1112,8 @@ impl DesktopRuntime {
     pub fn task_snapshot(&self, scope: &str, task: &str) -> Result<TaskSnapshot> {
         Ok(self.job(scope, task)?.context.snapshot())
     }
-    /// Releases task history and result ownership, requesting cancellation if needed.
+    /// Acknowledges disposal and requests cancellation if needed, without joining workers.
+    /// History and result ownership remain until every scheduled native reader exits.
     pub fn dispose_task(&self, scope: &str, task: &str) -> Result<()> {
         let job = self.job(scope, task)?;
         job.disposed.store(true, Ordering::Release);

@@ -1,9 +1,16 @@
 # {{project_name}}
 
-Revenant 0.3 builds a native desktop app with a static SvelteKit SPA. Edit
+Revenant 0.4 builds a native desktop app with a static SvelteKit SPA. Edit
 `revenant.toml` and `web/src/routes/+page.svelte`, then run `revenant dev` from
 this folder. Vite supplies HMR inside the desktop window. Closing the window or
 pressing Ctrl+C stops all processes owned by this CLI invocation.
+
+Use Node 24. The frontend pins SvelteKit 3, Svelte 5, Vite 8 and TypeScript 6.
+Svelte configuration lives in the Vite plugin; `#lib/*` is a declared package
+import and local module imports include their extension. The TypeScript config
+extends `$app/tsconfig` and explicitly includes application files. First
+installation creates `web/package-lock.json`; commit it and use
+`npm ci --install-links` for subsequent installs.
 
 ## Your files and generated files
 
@@ -29,29 +36,24 @@ and tasks. To add operations, create `native/Cargo.toml` and `native/src/lib.rs`
 ```toml
 [package]
 name = "{{project_name}}-native"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [workspace]
 
 [dependencies]
-revenant = { package = "revenant-sdk", version = "0.3.0", path = "../.revenant/sdk/crates/revenant-sdk" }
+revenant = { package = "revenant-sdk", version = "0.4.0", path = "../.revenant/sdk/crates/revenant-sdk" }
 ```
 
 ```rust
-use revenant::{Application, operations};
 mod records;
-
-/// Register the application capabilities; Revenant supplies the desktop runtime.
-pub fn app() -> Application {
-    Application::new().operations(operations![records::normalize])
-}
+revenant::app!();
 ```
 
 For example, put this in `native/src/records.rs`:
 
 ```rust
-use revenant::{contract, operation, Result, TaskContext};
+use revenant::{contract, operation};
 
 /// A record whose title is normalized without changing its identity.
 #[contract]
@@ -63,25 +65,43 @@ pub struct Record {
 }
 
 /// Trim and uppercase a record title.
-#[operation(id = "records.normalize")]
-pub async fn normalize(input: Record, context: TaskContext) -> Result<Record> {
-    context.checkpoint()?;
-    Ok(Record { title: input.title.trim().to_uppercase(), ..input })
+#[operation(id = "records.normalize", read_only, independent)]
+pub fn normalize(record: Record) -> Record {
+    Record { title: record.title.trim().to_uppercase(), ..record }
 }
 ```
 
-Declare payloads with `#[revenant::contract]` and operations with
-`#[revenant::operation(id = "records.normalize")]`. Rust owns validation, public
-types and operation documentation. Use `TaskContext` for cancellation and
-progress. Return the application from `app()` without writing a `main`, Tokio
-bootstrap, target cfgs, or registry/export glue. Restart `revenant dev` after
-adding `native/`; later source edits rebuild automatically.
+Declare domain payloads with `#[revenant::contract]` and ordinary functions with
+`#[revenant::operation]`. `revenant::app!()` discovers this crate's annotated
+functions; dependency operations require explicit composition. `id` overrides
+the module/function identifier and keeps a published API stable when source moves.
+Rust owns validation, public types and operation documentation. Sync and async
+functions can take zero or multiple owned named arguments and return a plain
+value or `revenant::Result<T>`. An optional final `TaskContext` receives
+cancellation and progress. No `main`, Tokio bootstrap or registry glue is needed.
+Restart `revenant dev` after adding `native/`; later source edits rebuild automatically.
+
+Named arguments generate one camelCase input object. The example accepts
+`{ record: { id, title } }`; scalar `text: String` accepts `{ text }`, and a
+function with no wire arguments accepts `{}`. `Option<T>` arguments are omitted
+when absent. During migration, `legacy_input` explicitly preserves a single
+argument's old raw wire shape. `read_only`, `independent` and `agent` are separate
+author declarations: reads can use query helpers, independent batch items can
+overlap within the worker budget, and only agent-marked operations enter app MCP.
 
 The layout calls generated `setupApp()` to create, provide, and clean up the root.
-Components import `useApp`
-from `$lib/revenant` and use typed `app.operations.records.normalize.run(input)`.
-Await `app.ready` before capability calls. Give resources and tasks a component
-scope and dispose it on teardown. Built-ins, including `files.checksum`, are
+Components import `useOperations` from `#lib/revenant.ts` and directly await
+typed native functions. The helper owns a component scope and waits for startup:
+
+```ts
+const api = useOperations();
+const record = await api.records.normalize({ record: { id: 'draft', title: '  hello  ' } });
+```
+
+Use `.run(input)` when you need progress, cancellation or explicit task control;
+use `.query()` on declared reads for a latest-result projection. `useApp()` still
+provides built-in files, media and settings with component ownership. Dispose
+explicit child scopes on teardown. Built-ins, including `files.checksum`, are
 already registered: do not register duplicate operation IDs.
 
 ## Native folders and tasks
@@ -119,6 +139,12 @@ or bun. The SPA output belongs in `build/web`; `frontendDist` is generated from
 that location. Set `[project] identifier` before distributing to give native
 settings and installed packages a stable identity.
 
+Set `[agents] enabled = true` to enable the installed application's local MCP
+bridge. Mark only the operations you want agents to invoke with `agent`.
+Connected agents can invoke author-exposed reads and writes without per-call
+confirmation; unmarked operations remain unavailable. `revenant inspect --json`,
+`revenant check --json` and `revenant mcp --project .` expose development evidence.
+
 ## Packaging
 
 `revenant build` compiles the native host, extracts and publishes its contract,
@@ -135,6 +161,11 @@ resolve Cargo/Node dependencies and packaging tooling. Tauri's platform
 prerequisites: https://v2.tauri.app/start/prerequisites/.
 
 ## Migration boundary
+
+The 0.4 SDK keeps the version 3 project layout. Its compiled manifest is version
+4, native bridge protocol is 3, and SDK/client compatibility revision is 2.
+Run `revenant sdk upgrade`, regenerate bindings, and migrate single raw inputs to
+named objects or temporarily add `legacy_input`. Keep public operation IDs stable.
 
 Version 2 and unversioned WASM/server configs are rejected. Copy UI into a new
 version 3 app, move Rust operations to an optional `native/` library, and remove

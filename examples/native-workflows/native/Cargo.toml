@@ -1,0 +1,8 @@
+[package]
+name = "native-workflows-fixture"
+version = "0.4.0"
+edition = "2024"
+[workspace]
+[dependencies]
+revenant = { package = "revenant-sdk", version = "0.4.0", path = "../.revenant/sdk/crates/revenant-sdk" }
+revenant-graphics = { version = "0.4.0", path = "../.revenant/sdk/crates/revenant-graphics" }

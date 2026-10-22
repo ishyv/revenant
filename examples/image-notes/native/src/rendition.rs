@@ -1,5 +1,6 @@
 //! Root-contained image resolution, bounded decoding and persistent JPEG caching.
 use crate::{
+    cache::Cache,
     catalog::Catalog,
     contracts::{RenderInput, Rendition},
     error::problem,
@@ -23,19 +24,24 @@ pub(crate) fn render(
 ) -> Result<Rendition> {
     let path = resolve_original(catalog, &input.id)?;
     let bound = if input.large { 1440 } else { 320 };
-    let cached = cache_path(catalog, &input.id, &path, bound)?;
+    let revision = original_revision(&path)?;
     context.checkpoint()?;
-    let bytes = if cached.is_file() {
-        fs::read(&cached).map_err(|e| problem("cache_io", e))?
-    } else {
-        let image = decode_thumbnail(&path, bound)?;
-        context.checkpoint()?;
-        let bytes = encode_bounded(image, if input.large { 82 } else { 76 })?;
-        context.checkpoint()?;
-        publish_cache(&cached, &bytes)?;
-        bytes
-    };
-    display_rendition(bytes, context)
+    let cache = Cache::open(catalog.directory(), context)?;
+    cache.remove_obsolete(&input.id, &revision, context)?;
+    let (bytes, warning) =
+        if let Some(bytes) = cache.read(&input.id, &revision, bound, MAX_ENCODED_IMAGE)? {
+            (bytes, None)
+        } else {
+            let image = decode_thumbnail(&path, bound)?;
+            context.checkpoint()?;
+            let bytes = encode_bounded(image, if input.large { 82 } else { 76 })?;
+            context.checkpoint()?;
+            let warning = cache.publish(&input.id, &revision, bound, &bytes, context)?;
+            (bytes, warning)
+        };
+    // Data URL payloads own their bytes; release the cache lease before display work.
+    drop(cache);
+    display_rendition(bytes, warning, context)
 }
 
 fn resolve_original(catalog: &Catalog, id: &str) -> Result<PathBuf> {
@@ -58,16 +64,9 @@ fn resolve_original(catalog: &Catalog, id: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn cache_path(catalog: &Catalog, id: &str, path: &Path, bound: u32) -> Result<PathBuf> {
+fn original_revision(path: &Path) -> Result<String> {
     let metadata = fs::metadata(path).map_err(|e| problem("image_unavailable", e))?;
-    let key = format!(
-        "{id}-{}-{}-{bound}.jpg",
-        metadata.len(),
-        modified(&metadata)
-    );
-    let directory = catalog.directory().join("renditions");
-    fs::create_dir_all(&directory).map_err(|e| problem("cache_io", e))?;
-    Ok(directory.join(key))
+    Ok(format!("{}-{}", metadata.len(), modified(&metadata)))
 }
 
 fn decode_thumbnail(path: &Path, bound: u32) -> Result<image::RgbImage> {
@@ -128,18 +127,11 @@ fn encode_bounded(mut image: image::RgbImage, quality: u8) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn publish_cache(cached: &Path, bytes: &[u8]) -> Result<()> {
-    let temporary = cached.with_file_name(format!("{}.tmp", uuid::Uuid::new_v4()));
-    fs::write(&temporary, bytes).map_err(|e| problem("cache_io", e))?;
-    // Another request may have already produced the identical rendition. Preserve
-    // the original best-effort rename behavior and return our freshly encoded bytes.
-    if fs::rename(&temporary, cached).is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    Ok(())
-}
-
-fn display_rendition(bytes: Vec<u8>, context: &TaskContext) -> Result<Rendition> {
+fn display_rendition(
+    bytes: Vec<u8>,
+    cache_warning: Option<String>,
+    context: &TaskContext,
+) -> Result<Rendition> {
     if bytes.len() > MAX_ENCODED_IMAGE {
         return Err(Error::new(
             "cache_invalid",
@@ -152,5 +144,6 @@ fn display_rendition(bytes: Vec<u8>, context: &TaskContext) -> Result<Rendition>
         data_url: format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)),
         width: dimensions.width(),
         height: dimensions.height(),
+        cache_warning,
     })
 }

@@ -1,13 +1,13 @@
 //! An admitted Arc is the read capability; reads never look up registry entries again. Chunk bounds and host responses remain checked.
 use super::*;
-pub(super) struct Resource {
+pub(super) struct FileResource {
     pub(super) handle: Handle,
     pub(super) metadata: FileMetadata,
     pub(super) port: Arc<dyn ResourcePort>,
     pub(super) cleanup: Option<Arc<dyn ResourceCleanup>>,
     pub(super) provider_count: Option<Arc<AtomicUsize>>,
 }
-impl Drop for Resource {
+impl Drop for FileResource {
     fn drop(&mut self) {
         if let Some(count) = &self.provider_count {
             count.fetch_sub(1, Ordering::AcqRel);
@@ -23,7 +23,7 @@ impl Drop for Resource {
 /// enforce task cancellation separately. Cleanup runs after the final reference drops.
 #[derive(Clone)]
 pub struct ResourceLease {
-    pub(super) resource: Arc<Resource>,
+    pub(super) resource: Arc<FileResource>,
 }
 impl ResourceLease {
     /// Checks native availability without reading content or reacquiring ownership.

@@ -5,8 +5,12 @@
 //! those guarantees into scoped UI objects; no network listener is involved.
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
+mod agent_bridge;
 mod file_port;
 pub mod files;
+mod native_store;
+#[cfg(all(feature = "native-surfaces", windows))]
+mod native_surfaces;
 mod options;
 mod previews;
 pub mod results;
@@ -14,13 +18,17 @@ mod runtime;
 mod settings;
 #[cfg(feature = "tauri-host")]
 mod tauri_host;
+mod work;
 
+pub use agent_bridge::mcp_if_requested;
+pub use native_store::{NativeStoreIssue, NativeStoreRecovery};
 pub use options::DesktopOptions;
 pub use previews::PreviewResponse;
 pub use revenant_core::{Error, Result};
-pub use runtime::{DesktopRuntime, UpdateSink};
+pub use runtime::{AgentSession, DesktopRuntime, UpdateSink};
 #[cfg(feature = "tauri-host")]
 pub use tauri_host::launch;
+pub use work::NativeWorkService;
 
 /// Writes the compiled contract for the private CLI export request.
 ///

@@ -1,8 +1,9 @@
 //! Scoped previews retain captured core leases, never arbitrary native paths.
 //! A random UUID token is the protocol read capability; only the owning UI scope
 //! may dispose it. Creation requires an exact lease/UI scope match. Disposing a
-//! scope blocks pending or future creations in that scope; scope IDs must not be
-//! reused. Registry owner release does not invalidate an admitted preview lease.
+//! scope requires retiring its resource scope first, blocking pending or future
+//! creations without historical tombstones. Registry owner release does not
+//! invalidate an admitted preview lease.
 //!
 //! Text decoding reads at most 64 KiB. Protocol responses allocate at most 4 MiB,
 //! support one byte range, and report the actual bounded slice honestly as 206.
@@ -14,11 +15,11 @@
 
 use revenant_core::serde::{Deserialize, Serialize};
 use revenant_core::serde_json::json;
-use revenant_core::{Error, ResourceLease, Result};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Mutex,
-};
+use revenant_core::{Error, ResourceLease, ResourceRegistry, Result};
+use std::{collections::HashMap, sync::Mutex};
+
+#[cfg(test)]
+mod tests;
 
 const TEXT_LIMIT: u64 = 64 * 1024;
 const RESPONSE_LIMIT: u64 = 4 * 1024 * 1024;
@@ -110,20 +111,28 @@ struct Preview {
 #[derive(Default)]
 struct State {
     previews: HashMap<String, Preview>,
-    disposed_scopes: HashSet<String>,
 }
 
 /// A thread-safe token registry retaining leases until explicit UI disposal.
 /// Hosts must dispose previews/scopes with their UI ownership lifecycle.
-#[derive(Default)]
 pub struct PreviewStore {
+    resources: ResourceRegistry,
     state: Mutex<State>,
 }
 
 impl PreviewStore {
-    /// Creates an empty preview registry without I/O or background workers.
-    pub fn new() -> Self {
-        Self::default()
+    /// Shares current resource-scope authority without I/O or background workers.
+    pub fn new(resources: ResourceRegistry) -> Self {
+        Self {
+            resources,
+            state: Mutex::new(State::default()),
+        }
+    }
+
+    /// Returns retained preview owner records for lifecycle diagnostics.
+    pub fn owner_record_count(&self) -> Result<usize> {
+        let state = self.state.lock().map_err(|_| poisoned())?;
+        Ok(state.previews.len())
     }
 
     /// Captures a lease under its exact owning UI scope, decoding at most 64 KiB
@@ -137,8 +146,8 @@ impl PreviewStore {
             ));
         }
         {
-            let state = self.state.lock().map_err(|_| poisoned())?;
-            active(&state, scope)?;
+            let _state = self.state.lock().map_err(|_| poisoned())?;
+            active(&self.resources, scope)?;
         }
         let metadata = lease.metadata();
         let mime = media_type(&metadata.mime, &metadata.name)?;
@@ -177,7 +186,7 @@ impl PreviewStore {
             PreviewKind::Unsupported => {}
         }
         let mut state = self.state.lock().map_err(|_| poisoned())?;
-        active(&state, scope)?;
+        active(&self.resources, scope)?;
         state.previews.insert(
             id,
             Preview {
@@ -195,13 +204,13 @@ impl PreviewStore {
     pub fn dispose(&self, scope: &str, id: &str) -> Result<()> {
         let removed = {
             let mut state = self.state.lock().map_err(|_| poisoned())?;
-            if let Some(preview) = state.previews.get(id) {
-                if preview.scope != scope {
-                    return Err(Error::new(
-                        "scope_mismatch",
-                        "Preview belongs to another UI scope",
-                    ));
-                }
+            if let Some(preview) = state.previews.get(id)
+                && preview.scope != scope
+            {
+                return Err(Error::new(
+                    "scope_mismatch",
+                    "Preview belongs to another UI scope",
+                ));
             }
             state.previews.remove(id)
         };
@@ -210,12 +219,18 @@ impl PreviewStore {
         Ok(())
     }
 
-    /// Retires a UI scope, drops its retained leases outside the registry lock,
-    /// and prevents pending/future creations. Repeated disposal is harmless.
+    /// Drops a retired scope's leases outside the preview lock. Retire its core
+    /// resource scope first so pending/future creations cannot publish; otherwise
+    /// returns `scope_active`. Repeated cleanup retains no historical records.
     pub fn dispose_scope(&self, scope: &str) -> Result<()> {
+        if self.resources.is_scope_active(scope) {
+            return Err(Error::new(
+                "scope_active",
+                "Retire the resource scope before cleaning up previews",
+            ));
+        }
         let removed = {
             let mut state = self.state.lock().map_err(|_| poisoned())?;
-            state.disposed_scopes.insert(scope.into());
             let ids: Vec<_> = state
                 .previews
                 .iter()
@@ -235,12 +250,16 @@ impl PreviewStore {
     /// at 4 MiB with an honest Content-Range. Invalid/unsatisfiable ranges return
     /// `preview_invalid_range` with status 416 and `bytes */total` in details;
     /// the host converts this structured error into its protocol response.
+    /// New reads require active scope authority; an admitted lease may finish
+    /// after retirement, even before the host removes its preview tokens.
     pub async fn read(&self, token: &str, range: Option<&str>) -> Result<PreviewResponse> {
         let preview = {
             let state = self.state.lock().map_err(|_| poisoned())?;
-            state.previews.get(token).cloned().ok_or_else(|| {
+            let preview = state.previews.get(token).ok_or_else(|| {
                 Error::new("preview_not_found", "Preview token is missing or disposed")
-            })?
+            })?;
+            active(&self.resources, &preview.scope)?;
+            preview.clone()
         };
         if preview.kind == PreviewKind::Unsupported {
             return Err(Error::new(
@@ -263,8 +282,8 @@ impl PreviewStore {
     }
 }
 
-fn active(state: &State, scope: &str) -> Result<()> {
-    if state.disposed_scopes.contains(scope) {
+fn active(resources: &ResourceRegistry, scope: &str) -> Result<()> {
+    if !resources.is_scope_active(scope) {
         Err(Error::new(
             "scope_disposed",
             "Preview UI scope has been disposed",

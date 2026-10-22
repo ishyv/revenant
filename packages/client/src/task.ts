@@ -12,7 +12,9 @@ import { Signal } from "./store.js";
 import type { Scope } from "./scope.js";
 import type { NativeRequest } from "./transport.js";
 
-/** Paged native batch outcomes. Retained only until the owning task/scope is disposed. */
+/** Paged native batch outcomes. Client access ends with task/scope disposal;
+ * native history may remain until executing workers exit.
+ */
 export class BatchResult<O> {
   /** Project retained native task outcomes through bounded, schema-checked pages. */
   constructor(
@@ -43,8 +45,8 @@ export class BatchResult<O> {
 }
 
 /** Native task observable with an eagerly maintained result promise, even without subscribers. */
-export class Task<O> implements Readable<TaskSnapshot<O>> {
-  private store = new Signal<TaskSnapshot<O>>({
+export class Task<O, U = never> implements Readable<TaskSnapshot<O, U>> {
+  private store = new Signal<TaskSnapshot<O, U>>({
     id: "",
     scope: "",
     state: "queued",
@@ -60,6 +62,11 @@ export class Task<O> implements Readable<TaskSnapshot<O>> {
   private reject!: (error: unknown) => void;
   private started: Promise<string>;
   private cleanup?: Promise<void>;
+  private updateStore = new Signal<U | undefined>(undefined);
+  private updateRevision = -1n;
+  private snapshotRevision = -1n;
+  /** Latest schema-checked application data. New subscribers receive the current value. */
+  readonly updates: Readable<U | undefined> = { subscribe: this.updateStore.subscribe };
   /** Standard Svelte store subscription; execution never depends on subscriber count. */
   readonly subscribe = this.store.subscribe;
   /** Settles from the native terminal snapshot; scope disposal rejects pending consumers. */
@@ -71,9 +78,10 @@ export class Task<O> implements Readable<TaskSnapshot<O>> {
     readonly owner: Scope,
     request: NativeRequest | (() => Promise<NativeRequest>),
     prepare: () => Promise<void> = async () => {},
-    private project: (snapshot: TaskSnapshot<unknown>, task: Task<O>) => O = (
+    private project: (snapshot: TaskSnapshot<unknown>, task: Task<O, U>) => O = (
       snapshot,
     ) => snapshot.result as O,
+    private checkUpdate?: (value: unknown) => void,
   ) {
     owner.own(this);
     this.result = new Promise<O>((resolve, reject) => {
@@ -110,26 +118,62 @@ export class Task<O> implements Readable<TaskSnapshot<O>> {
   }
 
   /** Latest host projection. Empty identity means native submission is still pending. */
-  get snapshot(): TaskSnapshot<O> {
+  get snapshot(): TaskSnapshot<O, U> {
     return this.store.current;
   }
   /** Native admission acknowledgement. Selection edits may use it as an input-freeze barrier. */
   get ready(): Promise<void> {
     return this.started.then(() => {});
   }
-  /** Whether the native executor has reached a terminal state. */
+  /** Whether the native snapshot is logically terminal; this does not prove worker exit. */
   get terminal(): boolean {
     return terminalStates.has(this.snapshot.state);
   }
 
   private accept(snapshot: TaskSnapshot<unknown>): void {
     if (this.disposed || this.terminal) return;
+    let pendingUpdate: U | undefined;
+    let hasUpdate = false;
+    let acceptedRevision: bigint | undefined;
+    try {
+      // Compatibility snapshots without revisions never replace a revisioned projection.
+      if (snapshot.revision !== undefined) {
+        if (!/^(0|[1-9][0-9]*)$/.test(snapshot.revision)) failure("invalid_task_revision", "Task revision is not a decimal counter");
+        const revision = BigInt(snapshot.revision);
+        if (revision <= this.snapshotRevision) return;
+        if (snapshot.update) {
+          if (!/^(0|[1-9][0-9]*)$/.test(snapshot.update.revision)) failure("invalid_task_revision", "Update revision is not a decimal counter");
+          const updateRevision = BigInt(snapshot.update.revision);
+          if (updateRevision > revision) failure("invalid_task_revision", "Update revision exceeds task revision");
+          if (updateRevision > this.updateRevision) {
+            if (new TextEncoder().encode(JSON.stringify(snapshot.update.value)).byteLength > 64 * 1024)
+              failure("task_update_limit", "Task update exceeds 64 KiB encoded JSON");
+            if (!this.checkUpdate) failure("task_updates_undeclared", "Operation has no compiled update contract");
+            this.checkUpdate(snapshot.update.value);
+            this.updateRevision = updateRevision;
+            pendingUpdate = structuredClone(snapshot.update.value) as U;
+            hasUpdate = true;
+          }
+        }
+        this.snapshotRevision = revision;
+        acceptedRevision = revision;
+      } else if (this.snapshotRevision >= 0n) return;
+      else if (snapshot.update) failure("invalid_task_revision", "Application updates require task revisions");
+    } catch (error) {
+      const failed = errorOf(error, "contract_violation");
+      this.store.set({ ...this.snapshot, state: "failed", error: failed });
+      this.finishFailure(failed);
+      return;
+    }
     const local = {
       ...snapshot,
       outcomes: snapshot.outcomes ?? [],
       cancelRequested: snapshot.cancelRequested || this.cancelPending,
-    } as TaskSnapshot<O>;
+    } as TaskSnapshot<O, U>;
     this.store.set(local);
+    if (this.disposed || (acceptedRevision !== undefined && acceptedRevision !== this.snapshotRevision)) return;
+    if (hasUpdate) this.updateStore.set(pendingUpdate);
+    if (this.disposed || (acceptedRevision !== undefined && acceptedRevision !== this.snapshotRevision)) return;
     if (!terminalStates.has(snapshot.state) || this.settled) return;
     if (snapshot.state === "succeeded" || snapshot.state === "partial") {
       try {
@@ -202,7 +246,9 @@ export class Task<O> implements Readable<TaskSnapshot<O>> {
     return this.owner.request({ action: "task.results", task, ...bounds });
   }
 
-  /** Release native task/result ownership and reject any pending result consumer. */
+  /** Close local publication and acknowledge native disposal/cancellation requests.
+   * Running executors retain their history/resources until actual exit; this promise is not a join.
+   */
   dispose(): Promise<void> {
     if (this.cleanup) return this.cleanup;
     this.disposed = true;
@@ -210,6 +256,7 @@ export class Task<O> implements Readable<TaskSnapshot<O>> {
       new CapabilityError("task_disposed", "Task ownership was disposed"),
     );
     this.store.clear();
+    this.updateStore.clear();
     this.owner.release(this);
     this.cleanup = (async () => {
       let task: string;

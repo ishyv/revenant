@@ -1,7 +1,7 @@
 //! Registry mutation and pinned dispatch share one lock. Public manifests contain sorted descriptors; execution and provider callbacks run outside that lock.
-use super::{ContractManifest, OperationRegistration, validate_registration};
+use super::{ContractManifest, ContractValidators, OperationRegistration, validate_registration};
 use crate::providers::{ProviderRecord, ProviderUse};
-use crate::{Error, ResourceRegistry, Result, TaskContext, validate_json};
+use crate::{Error, ResourceRegistry, Result, TaskContext};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -10,6 +10,7 @@ use std::{
 };
 pub(crate) struct RegisteredOperation {
     pub registration: OperationRegistration,
+    pub validators: Arc<ContractValidators>,
     pub provider: Option<String>,
 }
 #[derive(Default)]
@@ -54,7 +55,7 @@ impl OperationRegistry {
     /// and propagates invalid schema/contract failures. The executor is retained
     /// until removed by a provider transaction or the last registration drops.
     pub fn register(&self, registration: OperationRegistration) -> Result<()> {
-        validate_registration(&registration)?;
+        let validators = validate_registration(&registration)?;
         let mut data = locked(&self.inner);
         let id = &registration.descriptor.id;
         if data.operations.contains_key(id) || !data.reserved.is_empty() {
@@ -67,12 +68,13 @@ impl OperationRegistry {
             id.clone(),
             RegisteredOperation {
                 registration,
+                validators,
                 provider: None,
             },
         );
         Ok(())
     }
-    /// Builds the version 3/protocol 2 contract from operation IDs in sorted order.
+    /// Builds the version 6/protocol 5 contract from operation IDs in sorted order.
     /// Includes source metadata and documentation in the SHA-256 digest; does not
     /// start operations or prepare providers. JSON serialization failures propagate.
     pub fn manifest(&self) -> Result<ContractManifest> {
@@ -83,8 +85,8 @@ impl OperationRegistry {
             .collect();
         let bytes = serde_json::to_vec(&operations)?;
         Ok(ContractManifest {
-            version: 3,
-            protocol: 2,
+            version: revenant_core::CONTRACT_MANIFEST_VERSION,
+            protocol: revenant_core::BRIDGE_PROTOCOL_VERSION,
             digest: format!("sha256:{:x}", Sha256::digest(bytes)),
             operations,
         })
@@ -94,25 +96,37 @@ impl OperationRegistry {
     pub fn manifest_json(&self) -> Result<String> {
         Ok(serde_json::to_string(&self.manifest()?)?)
     }
-    pub(super) fn acquire(&self, id: &str) -> Result<(OperationRegistration, ProviderUse)> {
+    pub(super) fn acquire(
+        &self,
+        id: &str,
+    ) -> Result<(OperationRegistration, Arc<ContractValidators>, ProviderUse)> {
         let data = locked(&self.inner);
         let operation = data
             .operations
             .get(id)
             .ok_or_else(|| Error::new("operation_missing", format!("Unknown operation {id}")))?;
         let usage = ProviderUse::acquire(&data, operation.provider.as_deref())?;
-        Ok((operation.registration.clone(), usage))
+        Ok((
+            operation.registration.clone(),
+            operation.validators.clone(),
+            usage,
+        ))
     }
     pub(super) async fn execute(
         registration: &OperationRegistration,
+        validators: &ContractValidators,
         input: Value,
         context: TaskContext,
     ) -> Result<Value> {
         context.checkpoint()?;
-        validate_json(&registration.descriptor.input.schema, &input)?;
+        context.configure_work_class(registration.descriptor.work_class)?;
+        if let Some(updates) = &validators.updates {
+            context.configure_prepared_updates(updates.clone())?;
+        }
+        validators.input.validate(&input)?;
         registration.executor.validate_input(&input, &context)?;
         let output = registration.executor.execute(input, context).await?;
-        validate_json(&registration.descriptor.output.schema, &output)?;
+        validators.output.validate(&output)?;
         Ok(output)
     }
     /// Begins and finalizes a single-operation task while pinning its provider use.
@@ -122,7 +136,9 @@ impl OperationRegistry {
     pub async fn dispatch(&self, id: &str, input: Value, context: TaskContext) -> Result<Value> {
         let execution = context.begin()?;
         let result = match self.acquire(id) {
-            Ok((registration, _usage)) => Self::execute(&registration, input, context).await,
+            Ok((registration, validators, _usage)) => {
+                Self::execute(&registration, &validators, input, context).await
+            }
             Err(error) => Err(error),
         };
         execution.finish(result.clone())?;

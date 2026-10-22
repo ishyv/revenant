@@ -1,7 +1,7 @@
 // Generated from compiled Rust. Do not edit.
-import { createApp as createRuntime } from '@revenant/client';
+import { createApp as createRuntime, callableOperation } from '@revenant/client';
 import { setupApp as setupRuntimeApp, provideApp as provideRuntimeApp, useApp as useRuntimeApp } from '@revenant/client/svelte';
-import type { App, Operation, ContractManifest } from '@revenant/client';
+import type { App, Operation, ContractManifest, OperationFunction, ReadOperationFunction } from '@revenant/client';
 
 /** The native executable's exact manifest, including Rustdoc and source metadata. */
 export const contract = {{manifest}} satisfies ContractManifest;

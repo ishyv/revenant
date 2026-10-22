@@ -15,6 +15,18 @@ fn read(root: &Path, relative: &str) -> String {
 }
 
 #[test]
+fn native_preparation_holds_one_project_lease_and_drop_releases_it() {
+    let (_temp, root) = project();
+    let config = RevenantConfig::load(&root).unwrap();
+    let first = revenant::toolchain::desktop::DesktopBuild::new(&root, &config, false).unwrap();
+    let before = read(&root, ".revenant/inspection/build.json");
+    assert!(revenant::toolchain::desktop::DesktopBuild::new(&root, &config, false).is_err());
+    assert_eq!(read(&root, ".revenant/inspection/build.json"), before);
+    drop(first);
+    revenant::toolchain::desktop::DesktopBuild::new(&root, &config, false).unwrap();
+}
+
+#[test]
 fn builtin_scaffold_needs_only_svelte_and_version_three_config() {
     let (_temp, root) = project();
     for relative in [
@@ -65,14 +77,18 @@ fn builtin_scaffold_needs_only_svelte_and_version_three_config() {
         serde_json::json!({
             "identifier": "desktop-confirmation",
             "windows": ["main"],
-            "permissions": ["dialog:allow-message"]
+            "permissions": ["dialog:allow-message", "core:event:allow-listen",
+                "core:event:allow-unlisten", "core:window:allow-destroy"]
         })
     );
     assert_eq!(
         tauri["bundle"]["windows"]["webviewInstallMode"]["type"],
         "offlineInstaller"
     );
-    assert!(read(&root, "web/svelte.config.js").contains("fallback: 'index.html'"));
+    assert!(read(&root, "web/vite.config.js").contains("fallback: 'index.html'"));
+    assert!(!root.join("web/svelte.config.js").exists());
+    assert!(read(&root, "web/tsconfig.json").contains("$app/tsconfig"));
+    assert!(read(&root, "web/package.json").contains("#lib/*"));
 }
 
 #[test]
@@ -88,7 +104,7 @@ fn sdk_snapshot_resolves_without_the_cli_checkout() {
             manifest.display()
         );
         let config: toml::Value = toml::from_str(&fs::read_to_string(manifest).unwrap()).unwrap();
-        assert_eq!(config["package"]["version"].as_str(), Some("0.3.0"));
+        assert_eq!(config["package"]["version"].as_str(), Some("0.4.0"));
     }
     for relative in [
         "crates/revenant-desktop/src/tauri_host.rs",
@@ -96,6 +112,7 @@ fn sdk_snapshot_resolves_without_the_cli_checkout() {
         "crates/revenant-desktop/src/results/README.md",
         "crates/revenant-sdk/src/operations/contracts.rs",
         "packages/client/src/files.ts",
+        "packages/client/scripts/check-contracts.mjs",
         "packages/client/src/ui/CollectionView.svelte",
         "vendor/hyvui-1.0.0.tgz",
     ] {
@@ -105,7 +122,7 @@ fn sdk_snapshot_resolves_without_the_cli_checkout() {
         );
     }
     let client: Value = serde_json::from_str(&read(&sdk, "packages/client/package.json")).unwrap();
-    assert_eq!(client["version"], "0.3.0");
+    assert_eq!(client["version"], "0.4.0");
     let host: toml::Value = toml::from_str(&read(&root, ".revenant/desktop/Cargo.toml")).unwrap();
     assert_eq!(
         host["dependencies"]["tauri-plugin-dialog"].as_str(),
@@ -146,7 +163,7 @@ fn optional_library_package_and_custom_lib_path_are_detected() {
     fs::create_dir(root.join("native")).unwrap();
     fs::write(
         root.join("native/Cargo.toml"),
-        "[package]\nname='different-native-name'\nversion='0.3.0'\n[lib]\npath='operations.rs'\n",
+        "[package]\nname='different-native-name'\nversion='0.4.0'\n[lib]\npath='operations.rs'\n",
     )
     .unwrap();
     fs::write(
@@ -251,7 +268,7 @@ fn unsupported_config_and_old_sdk_preserve_successful_artifacts() {
         scaffold::prepare_host(&root, &config)
             .unwrap_err()
             .to_string()
-            .contains("predates desktop 0.3")
+            .contains("sdk upgrade")
     );
     assert_eq!(
         read(&root, "web/src/lib/revenant.ts"),

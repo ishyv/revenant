@@ -2,6 +2,8 @@
 use super::*;
 /// Thread-safe host cancellation signal polled at task checkpoints.
 /// The probe is shared with callers and must not block while checking its signal.
+/// Replacement and finalization release its task-owned reference outside task
+/// locks. A checkpoint already holding a cloned reference can still finish polling.
 pub trait CancellationProbe: Send + Sync + 'static {
     /// Returns whether the host requests cancellation; true is acknowledged at a checkpoint.
     fn is_cancelled(&self) -> bool;
@@ -16,9 +18,12 @@ impl TaskContext {
     /// Replaces the host probe until finalization. Returns `task_terminal` for a
     /// finalized task; setting a probe does not itself request cancellation.
     pub fn set_cancellation_probe(&self, probe: Arc<dyn CancellationProbe>) -> Result<()> {
-        let mut data = lock(&self.task.data);
-        Self::mutable(&data)?;
-        data.cancellation_probe = Some(probe);
+        let previous = {
+            let mut data = lock(&self.task.data);
+            Self::mutable(&data)?;
+            data.cancellation_probe.replace(probe)
+        };
+        drop(previous);
         Ok(())
     }
     /// Requests cooperative cancellation. Queued tasks become Cancelled and release
@@ -29,7 +34,11 @@ impl TaskContext {
             return Ok(self.snapshot());
         }
         let mut leases = HashMap::new();
-        let result = self.change(|data| {
+        let mut native_leases = HashMap::new();
+        let mut created_native = HashMap::new();
+        let mut probe = None;
+        let mut schema = None;
+        let publication = self.prepare_change(|data| {
             if data.snapshot.state.is_terminal() {
                 return Ok(());
             }
@@ -40,11 +49,19 @@ impl TaskContext {
                 data.snapshot.state = TaskState::Cancelled;
                 data.snapshot.error = Some(Error::cancelled());
                 leases = std::mem::take(&mut data.leases);
+                native_leases = std::mem::take(&mut data.native_leases);
+                created_native = std::mem::take(&mut data.created_native);
+                schema = data.update_schema.take();
+                probe = data.cancellation_probe.take();
             }
             Ok(())
-        });
+        })?;
+        self.rollback_created(created_native);
         drop(leases);
-        result
+        drop(native_leases);
+        drop(probe);
+        drop(schema);
+        Ok(publication.publish())
     }
     /// Cooperatively acknowledges a cancellation request. Finalization belongs to
     /// the executor, so recorded batch counters and legacy outcomes remain available.
@@ -62,17 +79,17 @@ impl TaskContext {
         if terminal {
             return Err(Error::new("task_terminal", "Task has already finished"));
         }
-        if let Some(parent) = &self.task.parent {
-            if let Err(error) = parent.context.checkpoint() {
-                // Finalizing a cancelled parent must not turn a child's next
-                // checkpoint into an unrelated task_terminal failure.
-                let parent_cancelled = lock(&parent.context.task.data).snapshot.cancel_requested;
-                if error.is_cancelled() || parent_cancelled {
-                    self.request_cancel()?;
-                    return Err(Error::cancelled());
-                }
-                return Err(error);
+        if let Some(parent) = &self.task.parent
+            && let Err(error) = parent.context.checkpoint()
+        {
+            // Finalizing a cancelled parent must not turn a child's next
+            // checkpoint into an unrelated task_terminal failure.
+            let parent_cancelled = lock(&parent.context.task.data).snapshot.cancel_requested;
+            if error.is_cancelled() || parent_cancelled {
+                self.request_cancel()?;
+                return Err(Error::cancelled());
             }
+            return Err(error);
         }
         if cancelled || probe.is_some_and(|p| p.is_cancelled()) {
             self.request_cancel()?;

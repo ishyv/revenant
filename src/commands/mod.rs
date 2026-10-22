@@ -3,6 +3,10 @@
 //! `new` writes a minimal app, `dev` owns Vite and native process trees, `build`
 //! publishes compiled contracts before packaging, and `setup` only diagnoses.
 pub mod build;
+pub mod check;
 pub mod dev;
+pub mod inspect;
+pub mod mcp;
 pub mod new;
+pub mod sdk;
 pub mod setup;

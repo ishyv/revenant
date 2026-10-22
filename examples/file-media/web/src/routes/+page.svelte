@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import { fromStore } from 'svelte/store';
-  import { useApp } from '$lib/revenant';
-  import type { Application } from '$lib/revenant';
+  import { useApp } from '#lib/revenant.ts';
+  import type { Application } from '#lib/revenant.ts';
   import { CollectionView, FilePreview, TaskStatus } from '@revenant/client/ui';
+  import { errorOf } from '@revenant/client';
   import type { BatchResult, FileCollection, FileEntry, FileSelection, Folder, Preview, Readable, ResultPage, TaskSnapshot } from '@revenant/client';
 
   const app = useApp().createScope();
@@ -20,6 +21,8 @@
   let page = $state<ResultPage<unknown>>();
   let error = $state('');
   let opening = $state(false);
+  let refreshing = $state(false);
+  let refreshController: AbortController | undefined;
   let previewVersion = 0;
   let alive = true;
   let folderApp: Application | undefined;
@@ -36,7 +39,7 @@
     if (current) void current.query(options).catch(report);
   });
   function report(failure: unknown) {
-    if (alive) error = failure instanceof Error ? failure.message : String(failure);
+    if (alive) error = errorOf(failure).message;
   }
   async function openFolder() {
     opening = true; error = '';
@@ -66,6 +69,21 @@
       const next = await folderApp.media.preview(file);
       if (!alive || version !== previewVersion) await next.dispose(); else preview = next;
     } catch (failure) { if (version === previewVersion) report(failure); }
+  }
+  async function refreshFiles() {
+    const current = library;
+    if (!current) return;
+    refreshController?.abort();
+    const controller = new AbortController();
+    refreshController = controller;
+    refreshing = true; error = '';
+    previewVersion++;
+    try {
+      await preview?.dispose(); preview = undefined; activeFile = undefined;
+      await current.refresh({ signal: controller.signal });
+    }
+    catch (failure) { if (!controller.signal.aborted && library === current) report(failure); }
+    finally { if (alive && refreshController === controller) refreshing = false; }
   }
   async function processFiles(kind: 'metadata' | 'checksum', all: boolean) {
     error = '';
@@ -104,7 +122,7 @@
     const bytes = BigInt(value);
     return bytes < 1024n ? `${value} B` : bytes < 1048576n ? `${bytes / 1024n} KiB` : `${bytes / 1048576n} MiB`;
   }
-  onDestroy(() => { alive = false; previewVersion++; app.dispose(); });
+  onDestroy(() => { alive = false; refreshController?.abort(); previewVersion++; app.dispose(); });
 </script>
 
 <svelte:head><title>File & media — Revenant desktop</title></svelte:head>
@@ -123,6 +141,8 @@
   </section>
   {#if library && selection}
     <h2>{folder?.name}</h2>
+    <button disabled={refreshing} onclick={refreshFiles}>{refreshing ? 'Refreshing…' : 'Refresh folder'}</button>
+    {#if refreshing}<button onclick={() => refreshController?.abort()}>Cancel refresh</button>{/if}
     <div class="library">
       <CollectionView collection={library} {selection} rowHeight={76}>
         {#snippet row(file: FileEntry)}

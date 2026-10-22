@@ -7,6 +7,11 @@ build/
 .revenant/
 *.revenant-stage-*
 _revenant/
+__pycache__/
+*.py[cod]
+
+# Disposable acceptance run captures and reviewer prompts/responses
+/acceptance/strata-querygroup-optional-*/
 
 # Local agent configuration, instructions, and task-tracker state
 /.agents/
@@ -14,3 +19,34 @@ _revenant/
 /.beads/
 /.beads.gate.lock
 AGENTS.md
+
+# Private local acceptance captures and audit ledgers (preserve locally)
+/docs/research/2026-10-09-native-workflow-scheduler-measurements.json
+/docs/research/2026-10-13-native-performance-evidence.json
+/docs/research/core-integrity/README.md
+/docs/research/core-integrity/autonomous-fixes-2026-10-13.md
+/docs/research/core-integrity/callback-allocation-evidence.json
+/docs/research/core-integrity/callback-delivery-2026-10-11.json
+/docs/research/core-integrity/callback-paired-evidence-2026-10-11.json
+/docs/research/core-integrity/callback-timing-evidence-2026-10-11.json
+/docs/research/core-integrity/coverage.json
+/docs/research/core-integrity/coverage.tsv
+/docs/research/core-integrity/delivery-2026-10-11.json
+/docs/research/core-integrity/implemented-upgrades.md
+/docs/research/core-integrity/quality-review-2026-10-13.md
+/docs/research/core-integrity/quality-review-evidence-2026-10-13.json
+/docs/research/core-integrity/reviews.json
+/docs/validation/agentic-efficiency-500000-debug.json
+/docs/validation/agentic-efficiency-policy-debug.json
+/docs/validation/agentic-isolated-preflight-local.json
+/docs/validation/agentic-packaged-ambiguity-local.json
+/docs/validation/agentic-packaged-mcp-local.json
+/docs/validation/agentic-sandbox-canary-03.json
+/docs/validation/agentic-sandbox-canary-04.json
+/docs/validation/agentic-workflow-local-01.json
+/docs/validation/agentic-workflow-local-02.json
+/docs/validation/agentic-workflow-local-03.json
+/docs/validation/native-backlog-500000.json
+/docs/validation/native-workflows-prepared-validation-2026-10-09.json
+/docs/validation/refresh-backlog-500000.json
+/docs/validation/windows-guest-local-smoke.json

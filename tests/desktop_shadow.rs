@@ -28,7 +28,7 @@ fn compile(executable: &Path, generation: &str) {
         .unwrap();
     assert!(
         output.status.success(),
-        "compiler could not replace its artifact: {}",
+        "compiler could not replace its {generation} artifact at {executable:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -96,10 +96,12 @@ fn exercise_shadow_lifecycle(root: PathBuf) {
     let build = DesktopBuild::new(&root, &RevenantConfig::load(&root).unwrap(), false).unwrap();
     compile(&build.executable, "first");
     let (logs, _receiver) = mpsc::channel();
-    // Negative control: Windows really locks this executable when launched directly.
+    // Prove direct image locking without mapping the compiler output under test.
+    let control_executable = root.join("direct-control.exe");
+    fs::copy(&build.executable, &control_executable).unwrap();
     let direct = ManagedProcess::spawn(
         &root,
-        &build.executable.to_string_lossy(),
+        &control_executable.to_string_lossy(),
         &[],
         "direct-control",
         logs.clone(),
@@ -109,7 +111,7 @@ fn exercise_shadow_lifecycle(root: PathBuf) {
     assert!(
         fs::OpenOptions::new()
             .write(true)
-            .open(&build.executable)
+            .open(&control_executable)
             .is_err()
     );
     drop(direct);

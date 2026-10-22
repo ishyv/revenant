@@ -6,3 +6,5 @@ identifier = "app.revenant.image-notes"
 title = "Luma — Image Notes"
 width = 1360
 height = 880
+[agents]
+enabled = true

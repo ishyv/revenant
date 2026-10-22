@@ -44,8 +44,8 @@ fn new_app_and_custom_native_compile_outside_checkout_and_preserve_failed_build_
     let config = RevenantConfig::load(&root).unwrap();
     let executable = DesktopBuild::new(&root, &config, false).unwrap().executable;
     let builtin = manifest(&root, &executable);
-    assert_eq!(builtin["version"], 3);
-    assert_eq!(builtin["protocol"], 2);
+    assert_eq!(builtin["version"], 6);
+    assert_eq!(builtin["protocol"], 5);
     let ids: Vec<_> = builtin["operations"]
         .as_array()
         .unwrap()
@@ -72,6 +72,8 @@ fn new_app_and_custom_native_compile_outside_checkout_and_preserve_failed_build_
     ] {
         fs::write(root.join(relative), content).unwrap();
     }
+    // Publication validates the independently installed client as the real CLI does.
+    build::ensure_frontend(&root, &config, true).unwrap();
     let generation = build::build_rust(&root, &config, false, true).unwrap();
     let compiled = manifest(&root, &executable);
     let operation = compiled["operations"]

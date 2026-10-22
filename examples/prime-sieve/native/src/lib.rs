@@ -2,22 +2,9 @@
 //!
 //! The UI receives native task projections; it never executes a WASM module or
 //! schedules Rust work in a web worker. The framework supplies the executable.
-use revenant::{
-    Application, Error, Progress, Result, TaskContext, contract, operation, operations,
-};
+use revenant::{Error, Progress, Result, TaskContext, contract, operation};
 
-/// Inclusive sieve limit. The native implementation bounds work and JSON output.
-#[contract]
-pub struct SieveInput {
-    /// Largest candidate, from zero through 1,000,000 inclusive.
-    pub limit: u32,
-}
-/// Single integer to check, represented exactly by a JavaScript number.
-#[contract]
-pub struct PrimeInput {
-    /// Unsigned 32-bit candidate.
-    pub value: u32,
-}
+revenant::app!();
 /// Bounded sieve output, with every prime in ascending order.
 #[contract]
 pub struct SieveResult {
@@ -30,9 +17,9 @@ pub struct SieveResult {
 }
 
 /// Check primality using trial division without allocating a sieve.
-#[operation(id = "primes.isPrime")]
-pub async fn is_prime(input: PrimeInput, context: TaskContext) -> Result<bool> {
-    let n = input.value;
+#[operation(id = "primes.isPrime", read_only, independent)]
+pub fn is_prime(value: u32, context: TaskContext) -> Result<bool> {
+    let n = value;
     context.checkpoint()?;
     if n < 2 {
         return Ok(false);
@@ -58,20 +45,20 @@ pub async fn is_prime(input: PrimeInput, context: TaskContext) -> Result<bool> {
 ///
 /// Limits above 1,000,000 return `limit_exceeded` so task results stay bounded.
 /// Native cancellation is checked during marking and result collection.
-#[operation(id = "primes.upTo")]
-pub async fn primes_up_to(input: SieveInput, context: TaskContext) -> Result<SieveResult> {
-    let primes = sieve(input.limit, &context)?;
+#[operation(id = "primes.upTo", read_only, independent)]
+pub fn primes_up_to(limit: u32, context: TaskContext) -> Result<SieveResult> {
+    let primes = sieve(limit, &context)?;
     Ok(SieveResult {
-        limit: input.limit,
+        limit,
         count: primes.len() as u32,
         primes,
     })
 }
 
 /// Count primes using the same bounded sieve without returning the prime list.
-#[operation(id = "primes.count")]
-pub async fn prime_count(input: SieveInput, context: TaskContext) -> Result<u32> {
-    Ok(sieve(input.limit, &context)?.len() as u32)
+#[operation(id = "primes.count", read_only, independent)]
+pub fn prime_count(limit: u32, context: TaskContext) -> Result<u32> {
+    Ok(sieve(limit, &context)?.len() as u32)
 }
 
 fn sieve(limit: u32, context: &TaskContext) -> Result<Vec<u32>> {
@@ -127,7 +114,59 @@ fn sieve(limit: u32, context: &TaskContext) -> Result<Vec<u32>> {
     Ok(primes)
 }
 
-/// Register ordinary Rust functions; Revenant supplies the runtime and exports.
-pub fn app() -> Application {
-    Application::new().operations(operations![is_prime, primes_up_to, prime_count])
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run<T>(work: impl FnOnce(TaskContext) -> Result<T>) -> Result<T> {
+        let resources = revenant::ResourceRegistry::new();
+        let scope = resources.create_scope(None).unwrap();
+        let context = revenant::TaskManager::new(resources)
+            .create(&scope, "prime")
+            .unwrap();
+        let execution = context.begin().unwrap();
+        let result = work(context);
+        execution
+            .finish(
+                result
+                    .as_ref()
+                    .map(|_| revenant::serde_json::Value::Null)
+                    .map_err(Clone::clone),
+            )
+            .unwrap();
+        result
+    }
+
+    #[test]
+    fn sync_prime_operations_keep_bounded_results_and_exact_wire_shapes() {
+        assert!(run(|context| is_prime(97, context)).unwrap());
+        assert!(!run(|context| is_prime(100, context)).unwrap());
+        let result = run(|context| primes_up_to(10, context)).unwrap();
+        assert_eq!(result.primes, [2, 3, 5, 7]);
+        assert_eq!(result.count, 4);
+        assert_eq!(run(|context| prime_count(10, context)).unwrap(), 4);
+        assert_eq!(
+            run(|context| prime_count(1_000_001, context))
+                .unwrap_err()
+                .code,
+            "limit_exceeded"
+        );
+        let manifest = app().manifest().unwrap();
+        for (id, field) in [
+            ("primes.isPrime", "value"),
+            ("primes.upTo", "limit"),
+            ("primes.count", "limit"),
+        ] {
+            let operation = manifest.operations.iter().find(|op| op.id == id).unwrap();
+            assert_eq!(operation.arguments, [field]);
+            assert_eq!(operation.effect, revenant::OperationEffect::ReadOnly);
+            assert!(operation.independent);
+            assert!(!operation.agent);
+            revenant::validate_json(
+                &operation.input.schema,
+                &revenant::serde_json::json!({field: 10}),
+            )
+            .unwrap();
+        }
+    }
 }

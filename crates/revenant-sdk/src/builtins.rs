@@ -57,7 +57,7 @@ pub enum MediaKind {
 /// Reads trusted leased metadata and identifies a MIME-based preview category.
 /// Ignores caller-supplied names and sizes. Returns cancellation or handle admission
 /// errors from the task context; does not read or decode file contents.
-#[operation(id = "media.readMetadata")]
+#[operation(id = "media.readMetadata", read_only, independent, legacy_input)]
 pub async fn read_metadata(input: FileEntry, ctx: TaskContext) -> Result<MediaMetadata> {
     ctx.checkpoint()?;
     let metadata = ctx.file_metadata(&input.handle)?;
@@ -115,7 +115,7 @@ pub struct Checksum {
 /// Reports byte progress and checks cancellation before each chunk and completion.
 /// Propagates admission, native I/O, changed-file, and cancellation errors; an empty
 /// file succeeds with the SHA-256 empty-input digest and zero bytes hashed.
-#[operation(id = "files.checksum")]
+#[operation(id = "files.checksum", read_only, independent, legacy_input)]
 pub async fn checksum(input: FileEntry, ctx: TaskContext) -> Result<Checksum> {
     use sha2::{Digest, Sha256};
     let metadata = ctx.file_metadata(&input.handle)?;

@@ -1,7 +1,11 @@
-# Desktop 0.3 implementation boundaries
+# Desktop 0.3 implementation boundaries — historical
 
-The approved design is [DESIGN.md](DESIGN.md). Active work is Beads
-`revenant-gl5`; [0.2 contracts](history/IMPLEMENTATION-0.2.md) are historical.
+This document describes the 0.3 implementation and is retained for historical
+context; its 0.3 API/version statements are not current Revenant guidance. The
+current 0.4 compatibility tuple is manifest 6 / native protocol 5 / SDK revision
+4. See [0.4 migration](MIGRATION-0.4.md), [SDK compatibility](SDK.md), and the
+[current validation status](VALIDATION.md). The approved design is
+[DESIGN.md](DESIGN.md); [0.2 contracts](history/IMPLEMENTATION-0.2.md) are historical.
 
 ## Public application surface
 

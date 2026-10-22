@@ -1,0 +1,8 @@
+version = 3
+[project]
+name = "native-workflows"
+identifier = "app.revenant.native-workflows"
+[desktop]
+native_surfaces = true
+[agents]
+enabled = true

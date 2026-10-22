@@ -3,13 +3,15 @@
 //! Transport handlers only admit requests here. Query metadata, execution state,
 //! and cleanup remain native even when the webview reloads or drops subscriptions.
 
+mod agents;
 mod dispatch;
+mod inspect;
 mod jobs;
-mod scopes;
+pub(crate) mod scopes;
 mod views;
 
 use crate::{DesktopOptions, Error, Result};
-use revenant_core::{ResourceRegistry, TaskManager};
+use revenant_core::{ApplicationPaths, ResourceRegistry, TaskManager, TaskServices};
 use revenant_sdk::{Application, Provider, Registry};
 use serde_json::Value;
 use std::{
@@ -22,6 +24,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+pub use agents::AgentSession;
 pub(crate) use jobs::JobRecord;
 pub(crate) use jobs::SelectionRecord;
 pub(crate) use scopes::ScopeRecord;
@@ -52,15 +55,22 @@ pub(crate) struct RuntimeInner {
     pub replacements:
         std::collections::BTreeMap<String, Arc<dyn Fn() -> Arc<dyn Provider> + Send + Sync>>,
     pub workers: Arc<Semaphore>,
+    pub work: Arc<crate::NativeWorkService>,
     pub admission: Arc<Semaphore>,
     pub control_workers: Arc<Semaphore>,
     pub control_admission: Arc<Semaphore>,
     #[cfg(feature = "tauri-host")]
     pub pickers: Arc<Semaphore>,
     pub closing: AtomicBool,
+    pub instance_id: String,
+    pub contract_digest: String,
+    pub trace: Mutex<inspect::TraceRing>,
+    pub frontend_reports: Mutex<std::collections::VecDeque<Value>>,
+    pub cleanup_failures: Mutex<std::collections::VecDeque<Error>>,
     pub settings: crate::settings::SettingsStore,
     pub previews: crate::previews::PreviewStore,
     pub cache_dir: PathBuf,
+    pub store_recovery: crate::NativeStoreRecovery,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -79,13 +89,18 @@ impl DesktopRuntime {
     /// Validates contracts and prepares native providers before serving UI requests.
     ///
     /// Data/cache paths must be supplied by the platform adapter or embedder.
-    /// No folder contents or file bytes are touched during initialization.
+    /// No selected-folder inventory or original file bytes are touched during
+    /// initialization. A bounded pass reclaims abandoned owned cache stores.
     pub async fn new(application: Application, options: DesktopOptions) -> Result<Self> {
         application.manifest()?;
-        if options.concurrency == 0 || options.max_scopes == 0 || options.max_views == 0 {
+        if options.concurrency == 0
+            || options.max_scopes == 0
+            || options.max_views == 0
+            || !(1..=65536).contains(&options.trace_capacity)
+        {
             return Err(Error::new(
                 "invalid_options",
-                "Native concurrency and ownership limits must be positive",
+                "Native concurrency/ownership limits must be positive and trace capacity must be 1..=65536",
             ));
         }
         let data_dir = options.data_dir.clone().ok_or_else(|| {
@@ -102,9 +117,22 @@ impl DesktopRuntime {
         })?;
         std::fs::create_dir_all(&data_dir).map_err(io_error)?;
         std::fs::create_dir_all(&cache_dir).map_err(io_error)?;
+        let recovery_path = cache_dir.clone();
+        let store_recovery =
+            tokio::task::spawn_blocking(move || crate::native_store::recover(&recovery_path))
+                .await
+                .map_err(io_error)?;
+        for issue in &store_recovery.issues {
+            eprintln!(
+                "Revenant native store recovery [{}] retained {}: {}",
+                issue.code,
+                issue.path.display(),
+                issue.message
+            );
+        }
         let settings = crate::settings::SettingsStore::new(&data_dir)?;
-        let previews = crate::previews::PreviewStore::new();
         let resources = ResourceRegistry::new();
+        let previews = crate::previews::PreviewStore::new(resources.clone());
         let registry = Registry::with_resources(resources.clone());
         let (operations, capabilities, replacements) = application.into_parts();
         registry
@@ -133,9 +161,27 @@ impl DesktopRuntime {
                 .install(capability.provider, capability.config)
                 .await?;
         }
-        let tasks = TaskManager::new(resources.clone());
         let workers = Arc::new(Semaphore::new(options.concurrency));
+        let work = Arc::new(crate::NativeWorkService::with_budget(
+            workers.clone(),
+            options.concurrency,
+            options.blocking_io_concurrency,
+            options.work_queue_capacity,
+        )?);
+        let tasks = TaskManager::with_services(
+            resources.clone(),
+            Arc::new(TaskServices::new(
+                Some(ApplicationPaths {
+                    app_id: options.app_id.clone(),
+                    data_dir: data_dir.clone(),
+                    cache_dir: cache_dir.clone(),
+                }),
+                Some(work.clone()),
+            )),
+        );
         let admission = Arc::new(Semaphore::new(options.concurrency + options.queue_capacity));
+        let contract_digest = registry.manifest()?.digest;
+        let trace_capacity = options.trace_capacity;
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 options,
@@ -149,11 +195,18 @@ impl DesktopRuntime {
                 selections: Mutex::new(HashMap::new()),
                 replacements,
                 workers,
+                work,
                 admission,
                 closing: AtomicBool::new(false),
+                instance_id: id("instance"),
+                contract_digest,
+                trace: Mutex::new(inspect::TraceRing::new(trace_capacity)),
+                frontend_reports: Mutex::new(std::collections::VecDeque::new()),
+                cleanup_failures: Mutex::new(std::collections::VecDeque::new()),
                 settings,
                 previews,
                 cache_dir,
+                store_recovery,
                 control_workers: Arc::new(Semaphore::new(2)),
                 control_admission: Arc::new(Semaphore::new(34)),
                 #[cfg(feature = "tauri-host")]
@@ -170,6 +223,12 @@ impl DesktopRuntime {
             ));
         }
         Ok(())
+    }
+
+    /// Reports this startup's bounded recovery pass for disposable native stores.
+    /// Active leases and failed cleanup are retained and retried on later startup.
+    pub fn store_recovery(&self) -> &crate::NativeStoreRecovery {
+        &self.inner.store_recovery
     }
 
     /// Reads one bounded preview response from an opaque native preview token.

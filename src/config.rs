@@ -5,6 +5,7 @@
 //! WASM targets and server sections are rejected rather than silently ignored.
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Author-owned application configuration, located by walking up from cwd.
@@ -28,6 +29,15 @@ pub struct RevenantConfig {
     pub toolchain: ToolchainConfig,
     #[serde(default)]
     pub desktop: DesktopConfig,
+    #[serde(default)]
+    pub agents: AgentsConfig,
+}
+
+/// Author-selected live application tools. Exposure also requires operation annotations.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentsConfig {
+    pub enabled: bool,
 }
 
 /// Application identity. `identifier` defaults to `app.revenant.<name>`.
@@ -36,6 +46,8 @@ pub struct RevenantConfig {
 pub struct ProjectConfig {
     pub name: String,
     pub identifier: Option<String>,
+    /// Application version used by executable resources and installers.
+    pub version: Option<String>,
 }
 
 /// Package manager used for installation, Vite, and Tauri CLI packaging.
@@ -56,18 +68,27 @@ impl Default for ToolchainConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct DesktopConfig {
+    /// Enables optional framework-owned native GPU viewports.
+    pub native_surfaces: bool,
     pub title: Option<String>,
     pub width: u32,
     pub height: u32,
     pub dev_port: u16,
+    /// PNG, ICO or ICNS assets relative to the application root.
+    pub icons: Option<Vec<PathBuf>>,
+    /// Explicit additive CSP sources keyed by directive, shared by dev and packages.
+    pub csp_allowances: BTreeMap<String, Vec<String>>,
 }
 impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
+            native_surfaces: false,
             title: None,
             width: 1100,
             height: 760,
             dev_port: 5173,
+            icons: None,
+            csp_allowances: BTreeMap::new(),
         }
     }
 }
@@ -100,6 +121,36 @@ impl RevenantConfig {
             "desktop width, height and dev_port must be positive"
         );
         let identifier = config.identifier();
+        semver::Version::parse(config.application_version())
+            .context("project.version must be a semantic version, for example 1.2.3")?;
+        if let Some(icons) = &config.desktop.icons {
+            anyhow::ensure!(
+                !icons.is_empty(),
+                "desktop.icons must contain at least one asset"
+            );
+        }
+        for (directive, sources) in &config.desktop.csp_allowances {
+            anyhow::ensure!(
+                matches!(
+                    directive.as_str(),
+                    "connect-src"
+                        | "img-src"
+                        | "media-src"
+                        | "font-src"
+                        | "style-src"
+                        | "script-src"
+                        | "worker-src"
+                        | "frame-src"
+                ),
+                "unsupported desktop.csp_allowances directive: {directive}"
+            );
+            for source in sources {
+                anyhow::ensure!(
+                    !source.is_empty() && !source.chars().any(|c| c.is_whitespace() || c == ';'),
+                    "CSP sources must be individual nonempty sources without whitespace or semicolons"
+                );
+            }
+        }
         anyhow::ensure!(
             identifier.split('.').count() >= 2
                 && identifier.split('.').all(|part| !part.is_empty()
@@ -115,6 +166,11 @@ impl RevenantConfig {
             .identifier
             .clone()
             .unwrap_or_else(|| format!("app.revenant.{}", self.project.name.replace('_', "-")))
+    }
+
+    /// Configured application version; framework package identity stays independent.
+    pub fn application_version(&self) -> &str {
+        self.project.version.as_deref().unwrap_or("0.4.0")
     }
 }
 

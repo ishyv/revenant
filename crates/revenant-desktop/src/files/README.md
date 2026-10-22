@@ -26,6 +26,23 @@ Queries, snapshot creation, and selection/final-owner cleanup also perform
 blocking storage work. The host should schedule them away from its UI thread,
 especially deletion of a large selection. This module starts no cleanup threads.
 
+Each index directory contains a versioned Revenant ownership record and an OS
+exclusive file lease retained with its SQLite connection. A forced exit releases
+the lease. The next desktop startup reclaims only a matching owned store whose
+lease can be acquired; unmarked legacy directories, links, and unexpected child
+paths remain untouched. The pass examines at most 256 registered stores, removes
+at most 64, and stops starting store work after 100 ms. Locked or inaccessible
+stores are reported by `DesktopRuntime::store_recovery()` and retried on later
+startup. Individual filesystem calls cannot be preempted by the elapsed budget.
+
+An explicitly marked `.revenant-native-stores` directory inside the configured
+cache retains small recovery metadata. Registrations are flushed before an
+ownership marker is published. A seekable cursor resumes across startup passes;
+unrelated cache entries cannot prevent later stores from being visited. Live and
+deferred registrations are copied into the next journal before the cursor
+advances. A process lease serializes registration and compaction across instances.
+Interrupted compaction may replay a registration, but cannot forget its store.
+
 `Ready` can include warnings. `Cancelled` and `Failed` contain inspectable partial
 metadata but reject batch selections. Cancellation publishes its final partial
 chunk/status, then `scan` returns the core `cancelled` error. Fatal scan errors

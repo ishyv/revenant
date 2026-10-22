@@ -46,6 +46,50 @@ impl DesktopRuntime {
         request: Value,
         sink: Option<UpdateSink>,
     ) -> Result<Value> {
+        let trace = super::inspect::TraceContext::frontend(&request, calling_window);
+        let operation = request
+            .get("operation")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let task = request
+            .get("task")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        lock(&self.inner.trace).push(
+            &trace,
+            "request.started",
+            operation.as_deref(),
+            task.as_deref(),
+            None,
+            None,
+        );
+        let result = self
+            .dispatch_inner(calling_window, request, sink, trace.clone())
+            .await;
+        let admitted_task = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .or(task.as_deref());
+        lock(&self.inner.trace).push(
+            &trace,
+            "request.completed",
+            operation.as_deref(),
+            admitted_task,
+            None,
+            result.as_ref().err().map(|error| error.code.as_str()),
+        );
+        result
+    }
+
+    async fn dispatch_inner(
+        &self,
+        calling_window: &str,
+        request: Value,
+        sink: Option<UpdateSink>,
+        trace: super::inspect::TraceContext,
+    ) -> Result<Value> {
         if serde_json::to_vec(&request)?.len() > self.inner.options.max_contract_bytes {
             return Err(Error::new(
                 "request_too_large",
@@ -86,17 +130,28 @@ impl DesktopRuntime {
                 action,
                 "scope.dispose"
                     | "view.dispose"
+                    | "view.cancel"
                     | "folder.dispose"
                     | "selection.dispose"
                     | "task.cancel"
                     | "task.dispose"
                     | "media.dispose"
+                    | "resource.release"
                     | "settings.save"
             ) {
                 runtime.accepting()?;
             }
             let executor = tokio::runtime::Handle::current();
             match action {
+                "resource.release" => {
+                    let handle: revenant_core::Handle = serde_json::from_value(
+                        request.get("handle").cloned().ok_or_else(|| Error::new("invalid_request", "A complete native resource handle is required"))?
+                    ).map_err(|error| Error::new("invalid_request", error.to_string()))?;
+                    // Explicit disposal checks full identity and scope, revokes
+                    // result-history re-admission, and runs cleanup outside locks.
+                    runtime.inner.resources.revoke_native(scope, &handle)?;
+                    Ok(Value::Null)
+                }
                 "scope.dispose" => {
                     runtime.dispose_scope(scope)?;
                     Ok(Value::Null)
@@ -111,21 +166,36 @@ impl DesktopRuntime {
                     runtime.dispose_folder(scope, string(&request, "folder")?)?;
                     Ok(Value::Null)
                 }
-                "folder.query" | "view.query" => {
+                "folder.query" | "view.query" | "view.refresh" => {
                     let (offset, limit) = window(&request)?;
                     let generation = number(&request, "generation", 1)?;
                     let options = request.get("options").cloned().unwrap_or_else(|| json!({}));
-                    let folder = if action == "view.query" {
-                        runtime
-                            .view(scope, string(&request, "view")?)?
-                            .folder
-                            .id
-                            .clone()
+                    if action == "folder.query" {
+                        runtime.query_folder_at(
+                            scope,
+                            string(&request, "folder")?,
+                            options,
+                            sink,
+                            offset,
+                            limit,
+                            generation,
+                        )
                     } else {
-                        string(&request, "folder")?.to_owned()
-                    };
-                    runtime
-                        .query_folder_at(scope, &folder, options, sink, offset, limit, generation)
+                        runtime.query_view_at(
+                            scope,
+                            string(&request, "view")?,
+                            options,
+                            sink,
+                            offset,
+                            limit,
+                            generation,
+                            action == "view.refresh",
+                        )
+                    }
+                }
+                "view.cancel" => {
+                    runtime.cancel_view_scan(scope, string(&request, "view")?)?;
+                    Ok(Value::Null)
                 }
                 "view.window" => {
                     let (offset, limit) = window(&request)?;
@@ -169,13 +239,14 @@ impl DesktopRuntime {
                     )?;
                     Ok(Value::Null)
                 }
-                "task.run" => Ok(serde_json::to_value(runtime.run_task(
+                "task.run" => Ok(serde_json::to_value(runtime.run_task_traced(
                     scope,
                     string(&request, "operation")?,
                     request.get("input").cloned().unwrap_or(Value::Null),
                     sink,
+                    trace,
                 )?)?),
-                "task.batch" => Ok(serde_json::to_value(runtime.run_batch(
+                "task.batch" => Ok(serde_json::to_value(runtime.run_batch_traced(
                     scope,
                     string(&request, "operation")?,
                     request.get("selection").cloned().ok_or_else(|| {
@@ -185,6 +256,7 @@ impl DesktopRuntime {
                         )
                     })?,
                     sink,
+                    trace,
                 )?)?),
                 "task.snapshot" => Ok(serde_json::to_value(
                     runtime.task_snapshot(scope, string(&request, "task")?)?,
@@ -242,6 +314,12 @@ impl DesktopRuntime {
                     Ok(Value::Null)
                 }
                 "runtime.inspect" => Ok(serde_json::to_value(runtime.inner.registry.inspect())?),
+                "runtime.snapshot" => runtime.runtime_inspect(),
+                "runtime.trace" => runtime.trace_query(number(&request, "afterSequence", 0)?, window(&request)?.1),
+                "frontend.snapshot" => {
+                    runtime.record_frontend_snapshot(json!({"window":calling_window,"scope":scope,"snapshot":request.get("snapshot").cloned().unwrap_or(Value::Null)}))?;
+                    Ok(Value::Null)
+                }
                 "runtime.configure" => {
                     executor.block_on(runtime.inner.registry.configure(
                         string(&request, "provider")?,
@@ -286,7 +364,9 @@ impl DesktopRuntime {
     pub fn dispose_window(&self, window: &str) -> Result<()> {
         let scopes: Vec<_> = lock(&self.inner.scopes)
             .iter()
-            .filter(|(_, s)| s.window == window && s.parent.is_none())
+            .filter(|(_, s)| {
+                s.owner == super::scopes::ScopeOwner::Window(window.into()) && s.parent.is_none()
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for scope in scopes {
