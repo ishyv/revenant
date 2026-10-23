@@ -1,6 +1,7 @@
 //! Official MCP transport and a current-user local bridge to an existing app.
 pub mod bridge;
 mod mcp;
+mod stdio;
 pub use bridge::{
     BridgeAccess, BridgeServer, InstanceInfo, InstanceSelector, RemoteBackend, discover_instances,
 };

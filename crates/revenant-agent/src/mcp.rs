@@ -75,9 +75,41 @@ impl ServerHandler for Adapter {
 
 /// Serve newline-delimited MCP on stdin/stdout; diagnostics belong on stderr.
 /// The backend closes on EOF, protocol failure, and orderly peer shutdown.
+/// Standard I/O is exclusively owned until backend cleanup and native worker
+/// joins finish. Pending responses get one second to drain after terminal input;
+/// this does not impose a deadline on arbitrary backend work.
 pub async fn serve_stdio(backend: Arc<dyn Backend>) -> anyhow::Result<()> {
-    let (input, output) = rmcp::transport::stdio();
-    serve_io(backend, input, output).await
+    serve_native(backend, crate::stdio::Stdio::open()).await
+}
+
+async fn serve_native(
+    backend: Arc<dyn Backend>,
+    stdio: std::io::Result<(
+        crate::stdio::Stdio,
+        crate::stdio::Input,
+        crate::stdio::Output,
+    )>,
+) -> anyhow::Result<()> {
+    let (stdio, input, output) = match stdio {
+        Ok(stdio) => stdio,
+        Err(error) => {
+            return match backend.close().await {
+                Ok(()) => Err(error.into()),
+                Err(cleanup) => Err(anyhow::Error::new(error)
+                    .context(format!("backend cleanup also failed: {cleanup}"))),
+            };
+        }
+    };
+    let result = serve_io(backend, input, output).await;
+    let stopped = stdio.shutdown().await;
+    match (result, stopped) {
+        (Err(error), Err(stopped)) => {
+            Err(error.context(format!("stdio cleanup also failed: {stopped}")))
+        }
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error.into()),
+        _ => Ok(()),
+    }
 }
 
 // Bound bytes before the SDK's newline accumulator allocates them. Keep the
@@ -86,7 +118,6 @@ const MAX_INPUT_FRAME: usize = 1024 * 1024;
 struct FrameBounded<R> {
     input: R,
     frame_bytes: usize,
-    terminal: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FrameBounded<R> {
     fn poll_read(
@@ -100,20 +131,12 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FrameBounded<R> {
         let mut buffer = tokio::io::ReadBuf::new(&mut bytes[..length]);
         match std::pin::Pin::new(&mut this.input).poll_read(cx, &mut buffer) {
             std::task::Poll::Ready(Ok(())) => {
-                if length > 0 && buffer.filled().is_empty() {
-                    if let Some(sender) = this.terminal.take() {
-                        let _ = sender.send(());
-                    }
-                }
                 for byte in buffer.filled() {
                     if *byte == b'\n' {
                         this.frame_bytes = 0;
                     } else {
                         this.frame_bytes += 1;
                         if this.frame_bytes > MAX_INPUT_FRAME {
-                            if let Some(sender) = this.terminal.take() {
-                                let _ = sender.send(());
-                            }
                             return std::task::Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 "MCP input frame exceeds 1 MiB",
@@ -124,25 +147,32 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FrameBounded<R> {
                 output.put_slice(buffer.filled());
                 std::task::Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(Err(error)) => {
-                if let Some(sender) = this.terminal.take() {
-                    let _ = sender.send(());
-                }
-                std::task::Poll::Ready(Err(error))
-            }
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
             other => other,
         }
     }
 }
 
-// ponytail: interrupts async SDK sends, not an already-running native stdout
-// blocking worker. Native pipe cancellation needs separate platform acceptance.
+// Interrupt SDK sends after grace. Dropping the native writer then signals its
+// worker; serve_stdio cancels and joins native I/O before returning to its caller.
 struct InterruptibleWrite<W> {
     output: W,
     interrupt: tokio::sync::oneshot::Receiver<()>,
     interrupted: bool,
+    failed: Option<tokio::sync::oneshot::Sender<std::io::Error>>,
 }
 impl<W> InterruptibleWrite<W> {
+    fn observe<T>(
+        &mut self,
+        result: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        if let std::task::Poll::Ready(Err(error)) = &result {
+            if let Some(sender) = self.failed.take() {
+                let _ = sender.send(std::io::Error::new(error.kind(), error.to_string()));
+            }
+        }
+        result
+    }
     fn check(&mut self, cx: &mut std::task::Context<'_>) -> std::io::Result<()> {
         use std::future::Future;
         if !self.interrupted {
@@ -166,7 +196,8 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for InterruptibleWr
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         this.check(cx)?;
-        std::pin::Pin::new(&mut this.output).poll_write(cx, bytes)
+        let result = std::pin::Pin::new(&mut this.output).poll_write(cx, bytes);
+        this.observe(result)
     }
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
@@ -174,7 +205,8 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for InterruptibleWr
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         this.check(cx)?;
-        std::pin::Pin::new(&mut this.output).poll_flush(cx)
+        let result = std::pin::Pin::new(&mut this.output).poll_flush(cx);
+        this.observe(result)
     }
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
@@ -182,7 +214,8 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for InterruptibleWr
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         this.check(cx)?;
-        std::pin::Pin::new(&mut this.output).poll_shutdown(cx)
+        let result = std::pin::Pin::new(&mut this.output).poll_shutdown(cx);
+        this.observe(result)
     }
 }
 
@@ -191,18 +224,66 @@ async fn serve_io(
     input: impl tokio::io::AsyncRead + Send + Unpin + 'static,
     output: impl tokio::io::AsyncWrite + Send + Unpin + 'static,
 ) -> anyhow::Result<()> {
-    let mut cleanup = None;
+    use tokio::io::{AsyncReadExt, AsyncWrite};
+    // Read independently of rmcp, which can await output while initializing or
+    // sending a protocol error. Backlog saturation is terminal, not an unbounded
+    // read-ahead allocation or a reader waiting forever behind a blocked writer.
+    // Count bytes, not reads: even byte-at-a-time peers can use the full bound.
+    let (mut buffered, sdk_input) = tokio::io::duplex(2 * MAX_INPUT_FRAME);
     let (terminal, mut input_ended) = tokio::sync::oneshot::channel();
+    let mut pump = InputPump(tokio::spawn(async move {
+        let result = async {
+            let mut input = FrameBounded {
+                input,
+                frame_bytes: 0,
+            };
+            loop {
+                let mut bytes = vec![0; crate::stdio::CHUNK];
+                let length = input.read(&mut bytes).await?;
+                if length == 0 {
+                    return Ok(());
+                }
+                bytes.truncate(length);
+                let mut pending = &bytes[..];
+                while !pending.is_empty() {
+                    // Scope out cooperative scheduling for this *try*-write:
+                    // a quota yield is not a full buffer. Yield after the chunk.
+                    let length = tokio::task::unconstrained(std::future::poll_fn(|cx| {
+                        match std::pin::Pin::new(&mut buffered).poll_write(cx, pending) {
+                            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+                            std::task::Poll::Pending => std::task::Poll::Ready(Err(
+                                std::io::Error::other("MCP input backlog exceeds 2 MiB"),
+                            )),
+                        }
+                    }))
+                    .await?;
+                    if length == 0 {
+                        return Err(std::io::ErrorKind::WriteZero.into());
+                    }
+                    pending = &pending[length..];
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        .await;
+        let _ = terminal.send(result);
+    }));
+    let mut cleanup = None;
     let (interrupt, interrupted) = tokio::sync::oneshot::channel();
-    let outcome = async {
+    let (failed, mut output_failed) = tokio::sync::oneshot::channel();
+    let mut input_failure = None;
+    let mut output_failure = None;
+    let stopping = tokio::sync::Notify::new();
+    let session = async {
         let service = Adapter(backend.clone())
             .serve((
-                FrameBounded {
-                    input,
-                    frame_bytes: 0,
-                    terminal: Some(terminal),
+                sdk_input,
+                InterruptibleWrite {
+                    output,
+                    interrupt: interrupted,
+                    interrupted: false,
+                    failed: Some(failed),
                 },
-                InterruptibleWrite { output, interrupt: interrupted, interrupted: false },
             ))
             .await?;
         let cancellation = service.cancellation_token();
@@ -210,28 +291,95 @@ async fn serve_io(
         tokio::pin!(waiting);
         tokio::select! {
             result = &mut waiting => { result?; }
-            terminal = &mut input_ended => {
-                if terminal.is_ok() {
-                    cancellation.cancel();
-                    let drain = async {
-                        // Borrow waiting so expiry never detaches the SDK service.
-                        match tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting).await {
-                            Ok(result) => result,
-                            Err(_) => {
-                                let _ = interrupt.send(());
-                                waiting.await
-                            }
-                        }
-                    };
-                    let (closed, drained) = tokio::join!(backend.close(), drain);
-                    cleanup = Some(closed);
-                    drained?;
-                } else { waiting.await?; }
+            _ = stopping.notified() => {
+                cancellation.cancel();
+                waiting.await?;
             }
         }
         Ok::<_, anyhow::Error>(())
+    };
+    let outcome = {
+        tokio::pin!(session);
+        enum End {
+            Session(anyhow::Result<()>),
+            Input(Result<std::io::Result<()>, tokio::sync::oneshot::error::RecvError>),
+            Output(std::io::Error),
+        }
+        let end = tokio::select! {
+            result = &mut session => End::Session(result),
+            terminal = &mut input_ended => End::Input(terminal),
+            Ok(error) = &mut output_failed => End::Output(error),
+        };
+        match end {
+            End::Session(result) => result,
+            terminal => {
+                match terminal {
+                    End::Input(Ok(Ok(()))) => {
+                        // The monitor can see EOF ahead of buffered requests.
+                        // Let rmcp consume those bytes and reach EOF naturally.
+                    }
+                    End::Input(result) => {
+                        input_failure = Some(match result {
+                            Ok(Err(error)) => error,
+                            Err(error) => {
+                                std::io::Error::other(format!("MCP input monitor failed: {error}"))
+                            }
+                            _ => unreachable!(),
+                        });
+                        stopping.notify_one();
+                    }
+                    End::Output(error) => {
+                        output_failure = Some(error);
+                        stopping.notify_one();
+                    }
+                    End::Session(_) => unreachable!(),
+                }
+                let drain = async {
+                    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut session)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            // Notify retains a permit if still initializing.
+                            stopping.notify_one();
+                            let _ = interrupt.send(());
+                            session.await
+                        }
+                    }
+                };
+                let (closed, drained) = tokio::join!(backend.close(), drain);
+                cleanup = Some(closed);
+                drained
+            }
+        }
+    };
+    // Do not detach the pump if the SDK exits with stdin still open. Native
+    // read cancellation is subsequently owned by serve_stdio, not Tokio's pool.
+    pump.0.abort();
+    let monitored = (&mut pump.0).await;
+    if let Err(error) = monitored {
+        if !error.is_cancelled() {
+            input_failure.get_or_insert_with(|| std::io::Error::other(error));
+        }
     }
-    .await;
+    // EOF closes SDK ingress only after the pump publishes its outcome. Collect
+    // it after joining even when the SDK won select!, or an I/O error can become
+    // a generic initialization failure (or a successful established close).
+    if let Ok(Err(error)) = input_ended.try_recv() {
+        input_failure = Some(error);
+    }
+    if let Ok(error) = output_failed.try_recv() {
+        output_failure = Some(error);
+    }
+    let mut outcome = outcome;
+    for (label, failure) in [("input", input_failure), ("output", output_failure)] {
+        if let Some(error) = failure {
+            outcome = Err(match outcome {
+                Ok(()) => error.into(),
+                Err(previous) => previous.context(format!("MCP {label} failed: {error}")),
+            });
+        }
+    }
     let cleanup = match cleanup {
         Some(cleanup) => cleanup,
         None => backend.close().await,
@@ -245,6 +393,13 @@ async fn serve_io(
         _ => {}
     }
     Ok(())
+}
+
+struct InputPump(tokio::task::JoinHandle<()>);
+impl Drop for InputPump {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +538,7 @@ mod tests {
             output: BlockedFlush,
             interrupt: receiver,
             interrupted: false,
+            failed: None,
         };
         output.write_all(b"accepted before flush").await.unwrap();
         {
@@ -562,6 +718,288 @@ mod tests {
         blocked_response_eof(true).await;
     }
 
+    async fn blocked_handshake_eof(request: &[u8], resume_output: bool) {
+        use std::time::Duration;
+        let backend = Arc::new(BackendProbe(AtomicBool::new(false)));
+        let (mut writer, input) = tokio::io::duplex(8192);
+        let (output, mut reader) = tokio::io::duplex(1);
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut server = tokio::spawn(serve_io(
+            backend.clone(),
+            input,
+            ObservedWrite {
+                output,
+                armed: Arc::new(AtomicBool::new(true)),
+                blocked: blocked.clone(),
+                dropped: dropped.clone(),
+            },
+        ));
+        writer.write_all(request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), blocked.notified())
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_millis(500), async {
+            while !backend.0.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        if resume_output {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(&mut reader);
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], 1);
+            assert!(response.get("result").is_some() || response.get("error").is_some());
+        }
+        let result = tokio::time::timeout(Duration::from_secs(3), &mut server).await;
+        let finished = result.is_ok();
+        // Release every owned task on failure as well as on success.
+        drop(reader);
+        match result {
+            Ok(result) => {
+                let _ = result.expect("MCP server task panicked");
+            }
+            Err(_) => {
+                let _ = server
+                    .await
+                    .expect("MCP server task panicked during cleanup");
+            }
+        }
+        assert!(closed, "EOF must start cleanup during a blocked handshake");
+        assert!(
+            finished,
+            "blocked handshake must be interrupted after grace"
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn eof_during_initialization_starts_cleanup_and_interrupts_output() {
+        blocked_handshake_eof(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}\n", false).await;
+    }
+
+    #[tokio::test]
+    async fn eof_during_initialization_error_starts_cleanup_and_interrupts_output() {
+        blocked_handshake_eof(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn initialization_response_is_preserved_when_output_resumes_during_grace() {
+        blocked_handshake_eof(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}\n", true).await;
+    }
+
+    #[tokio::test]
+    async fn initialization_error_is_preserved_when_output_resumes_during_grace() {
+        blocked_handshake_eof(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_runs_once_and_retains_transport_and_backend_failures() {
+        use std::sync::atomic::AtomicUsize;
+        struct FailingClose(AtomicUsize);
+        impl Backend for FailingClose {
+            fn tools(&self) -> Vec<AgentTool> {
+                Vec::new()
+            }
+            fn call<'a>(
+                &'a self,
+                _: &'a str,
+                _: serde_json::Value,
+            ) -> BackendFuture<'a, serde_json::Value> {
+                Box::pin(async { unreachable!("no tool call is sent") })
+            }
+            fn close(&self) -> BackendFuture<'_, ()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(revenant_core::Error::new(
+                        "cleanup_fixture",
+                        "backend close failed",
+                    ))
+                })
+            }
+        }
+        let backend = Arc::new(FailingClose(AtomicUsize::new(0)));
+        let result = serve_io(backend.clone(), tokio::io::empty(), tokio::io::sink()).await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("backend cleanup also failed"), "{error}");
+        assert!(
+            error.contains("initialize"),
+            "retain the transport cause: {error}"
+        );
+        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stdio_open_failure_still_closes_backend() {
+        let backend = Arc::new(BackendProbe(AtomicBool::new(false)));
+        let result = serve_native(
+            backend.clone(),
+            Err(std::io::Error::other("fixture cannot open stdio")),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot open stdio")
+        );
+        assert!(backend.0.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn input_backlog_saturation_is_a_transport_error_and_closes_backend() {
+        let backend = Arc::new(BackendProbe(AtomicBool::new(false)));
+        let mut payload = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".to_vec();
+        // Empty frames obey the individual frame limit. The SDK cannot consume
+        // them while the initial ping response is blocked on the one-byte sink.
+        payload.resize(3 * MAX_INPUT_FRAME, b'\n');
+        let (output, _reader) = tokio::io::duplex(1);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            serve_io(backend.clone(), std::io::Cursor::new(payload), output),
+        )
+        .await
+        .expect("saturated input must not deadlock behind output");
+        assert!(result.unwrap_err().to_string().contains("backlog exceeds"));
+        assert!(backend.0.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fragmented_input_does_not_exhaust_the_byte_backlog_limit() {
+        struct OneByte(std::io::Cursor<Vec<u8>>);
+        impl tokio::io::AsyncRead for OneByte {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                output: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                use std::io::Read;
+                if output.remaining() != 0 {
+                    let mut byte = [0];
+                    let length = self.0.read(&mut byte)?;
+                    output.put_slice(&byte[..length]);
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut bytes = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}\n".to_vec();
+        bytes.resize(2048, b'\n');
+        let backend = Arc::new(BackendProbe(AtomicBool::new(false)));
+        serve_io(
+            backend.clone(),
+            OneByte(std::io::Cursor::new(bytes)),
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap();
+        assert!(backend.0.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn postinitialize_output_failure_closes_backend_while_input_is_open() {
+        use tokio::io::AsyncBufReadExt;
+        let backend = Arc::new(BackendProbe(AtomicBool::new(false)));
+        let (mut writer, input) = tokio::io::duplex(8192);
+        let (output, reader) = tokio::io::duplex(8192);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut server = tokio::spawn(serve_io(backend.clone(), input, output));
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}\n").await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut String::new()),
+        )
+        .await
+        .expect("MCP initialization response timeout")
+        .unwrap();
+        drop(reader);
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n").await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await;
+        let finished = result.is_ok();
+        if let Ok(result) = result {
+            assert!(result.unwrap().is_err(), "report the broken output");
+        }
+        drop(writer);
+        if !finished {
+            let _ = server.await.unwrap();
+        }
+        assert!(finished, "stdout failure must not wait for stdin EOF");
+        assert!(backend.0.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn clean_eof_preserves_buffered_ping_responses() {
+        use tokio::io::AsyncReadExt;
+        for _ in 0..32 {
+            let backend = Arc::new(BackendProbe(AtomicBool::new(false)));
+            let bytes = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+            let (output, mut reader) = tokio::io::duplex(8192);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                serve_io(backend, &bytes[..], output),
+            )
+            .await
+            .expect("MCP EOF drain timeout")
+            .unwrap();
+            let mut responses = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                reader.read_to_string(&mut responses),
+            )
+            .await
+            .expect("MCP writer was not released after EOF")
+            .unwrap();
+            let ids: Vec<_> = responses
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_u64()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(ids, vec![1, 2], "EOF must drain accepted ping: {responses}");
+        }
+    }
+
+    #[tokio::test]
+    async fn input_error_is_retained_when_the_sdk_finishes_first() {
+        struct ReadError;
+        impl tokio::io::AsyncRead for ReadError {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("unique input failure")))
+            }
+        }
+        for _ in 0..32 {
+            let backend = Arc::new(BackendProbe(AtomicBool::new(false)));
+            let error = serve_io(backend, ReadError, tokio::io::sink())
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("unique input failure"),
+                "{error:#}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn frame_bound_accepts_exact_limit_and_resets_for_each_newline() {
         use tokio::io::AsyncReadExt;
@@ -572,7 +1010,6 @@ mod tests {
         let mut input = FrameBounded {
             input: std::io::Cursor::new(payload.clone()),
             frame_bytes: 0,
-            terminal: None,
         };
         let mut received = Vec::new();
         input.read_to_end(&mut received).await.unwrap();
@@ -587,7 +1024,6 @@ mod tests {
         let mut input = FrameBounded {
             input: std::io::Cursor::new(payload),
             frame_bytes: 0,
-            terminal: None,
         };
         let mut received = Vec::new();
         assert_eq!(
