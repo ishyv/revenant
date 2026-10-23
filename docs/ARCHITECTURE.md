@@ -68,12 +68,23 @@ Each connection owns its tasks and resources. Disconnect requests cancellation;
 captured leases survive until execution ends. See the [migration](MIGRATION-0.4.md)
 for configuration, tool behavior and compatibility boundaries.
 
-After the adapter observes terminal input, it starts backend cleanup concurrently
-with response draining. Async output gets a one-second grace before pending SDK
-writes are interrupted; the same SDK service is then awaited, not detached.
-This is not a bounded native-process-exit guarantee: Tokio's already-started
-blocking stdout writes remain uncancellable, and input EOF cannot be observed
-while SDK initialization or protocol-error handling is blocked sending output.
+The MCP adapter monitors input independently of SDK initialization and output.
+Frames remain bounded to 1 MiB; a saturated 2 MiB read-ahead queue closes the
+connection with a transport error instead of accumulating unlimited input or
+waiting behind an unread response. Terminal input starts backend cleanup
+concurrently with a one-second response grace. Output that resumes during grace
+can complete; after grace, pending writes are interrupted and the SDK is awaited.
+An output failure starts teardown even if the peer keeps stdin open. Terminal
+I/O errors remain observable when SDK completion races their notification.
+
+Native stdin/stdout use owned, dedicated workers rather than Tokio's blocking
+pool. Unix workers use nonblocking descriptors and finite polling; Windows
+workers use synchronous pipe I/O with repeated thread-specific cancellation.
+Both workers are joined before `serve_stdio` returns, including when stdin is
+still open after an output failure. MCP exclusively owns standard I/O while
+serving; Unix descriptor flags are restored after both workers have joined.
+This bounds pipe-related shutdown, not arbitrary backend cleanup or application
+work. Cancellation still preserves the backend's resource and task lifetimes.
 
 ## Native ownership and bounds
 

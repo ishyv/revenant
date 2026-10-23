@@ -46,6 +46,46 @@ The following concerns are not represented as fixed by this checkpoint:
 - The existing HyvUI archive has font notices but no verified top-level software
   license grant. No new third-party redistribution-rights claim is made.
 
+### MCP shutdown continuation
+
+Linux cloud reproduction confirmed that the checkpoint CLI stayed alive after
+stdin EOF with unread stdout, both during initialization and after a completed
+handshake. The updated adapter passes seven CLI process regressions in
+`tests/mcp_shutdown.rs`: blocked initialization, blocked pre-initialization error,
+blocked post-initialization output, closed stdout before/after initialization
+with stdin open, oversized input with stdin open, and buffered responses at EOF.
+Blocked-output children must exit within five seconds without the test first
+dropping unread stdout. A separate ten-second watchdog covers blocking setup I/O
+and kills/reaps a timed-out child. An additional regression proves that watchdog
+using a deliberately stalled subprocess; its child-only fixture is otherwise
+ignored. Expected exit codes prevent premature crashes from passing as shutdown.
+
+Adapter tests cover prompt cleanup during blocked initialization/error replies,
+responses resuming during grace, buffered requests at EOF, byte-fragmented input,
+bounded backlog, input/output failure races, exactly-once backend cleanup,
+combined failures, frame limits and latched output interruption. Native
+Unix tests cover blocked read/write worker joins, ordered partial writes and
+restoration of shared descriptor flags after both workers finish. The Windows
+agent code cross-compiles for `x86_64-pc-windows-gnu`; this is not Windows runtime
+evidence. Existing Windows and Linux/macOS workspace CI commands include these
+regressions, but were not dispatched from this cloud session. Native Windows and
+macOS process acceptance remains outstanding, as does installed-app acceptance.
+
+Cloud Rust validation completed with 381 tests passed, 0 failed and 13 ignored
+using `cargo test --workspace --all-features --locked --no-fail-fast`. The ignored
+count includes the subprocess-only watchdog fixture exercised by its parent test;
+other ignored/hardware checks remain separate gates. Locked all-feature workspace
+checking, desktop checking without default features, formatting, and strict agent
+Rustdoc also passed. Thirty repeated native-directory-input failures retained
+their I/O cause, and thirty pipelined EOF runs preserved both expected replies.
+
+An earlier workspace attempt failed
+`native_store::tests::a_replaced_lease_file_does_not_prove_abandonment` with a
+preserved-count assertion. That untouched test passed alone and in all 29 desktop
+unit tests on an archived checkpoint, and passed in the complete final run. No
+native-store assertion, recovery budget or implementation was changed; the
+initial failure is retained here rather than attributed to a confirmed cause.
+
 Private operational ledgers, reviewer payloads, raw local captures, and the local
 Beads database do not automatically travel with a cloud clone. Original local
 records are preserved separately, not converted into invented passing evidence.
